@@ -450,6 +450,12 @@ class SchematicWriter:
         self._collect_cap_banks()
         self._layout_cap_banks()
 
+        # Resistor banks: same lifecycle -- collect tagged resistors, derive the
+        # common-pin suppression set, and re-lay them into a tight row (with each
+        # member rotated so its common pin faces the rail) before labels.
+        self._collect_resistor_banks()
+        self._layout_resistor_banks()
+
         # Add pin-level net labels
         labels_start = time.perf_counter()
         logger.info(
@@ -461,6 +467,9 @@ class SchematicWriter:
 
         # Cap banks: draw the two shared rails + one net marker per rail.
         self._draw_cap_bank_rails()
+        # Resistor banks: draw the single shared rail + one common-net marker;
+        # fan-out pins keep the per-pin labels just emitted above.
+        self._draw_resistor_bank_rails()
         logger.debug(
             f"  Label tracking: {len(component_labels)} components with labels"
         )
@@ -1384,6 +1393,14 @@ class SchematicWriter:
                 ):
                     continue
 
+                # Resistor-bank *common* pins are wired by the shared rail (drawn in
+                # _draw_resistor_bank_rails); suppress only those. Fan-out pins fall
+                # through and keep their own per-pin label.
+                if (actual_ref, str(pin_identifier)) in getattr(
+                    self, "_resistor_bank_suppress", ()
+                ):
+                    continue
+
                 # Find component using the API
                 comp = self.component_manager.find_component(actual_ref)
 
@@ -1759,6 +1776,175 @@ class SchematicWriter:
             logger.info(
                 f"cap_bank '{bank_id}': drew 2 rails for {len(syms)} caps "
                 f"({bank['pos_net']} / {bank['neg_net']})"
+            )
+
+    def _collect_resistor_banks(self):
+        """Group resistor-bank-tagged resistors and build the common-pin suppress set.
+
+        Reads the ``resistor_bank`` / ``resistor_bank_pitch`` / ``resistor_bank_common``
+        / ``resistor_bank_side`` properties (set by :func:`circuit_synth.resistor_bank`),
+        finds each member's *common* pin (the pin on the declared ``common`` net),
+        records which ``(ref, pin)`` markers the label step must skip (only the common
+        pins -- fan-out pins keep their labels), and resolves the rail side. The
+        directive properties are stripped so they do not surface as symbol fields.
+
+        Unlike cap banks, the common net is asserted by the caller, so a member that
+        does not straddle it on exactly one pin is a hard error (raised here as a
+        backstop to the call-site check in ``resistor_bank``).
+        """
+        self._resistor_banks = {}
+        self._resistor_bank_suppress = set()
+
+        tagged = {}  # any ref form -> bank_id
+        meta = {}    # bank_id -> {pitch_mm, common, side}
+        ref_map = getattr(self, "reference_mapping", {}) or {}
+        for comp in self.circuit.components:
+            props = getattr(comp, "properties", None) or {}
+            bank_id = props.get("resistor_bank")
+            if not bank_id:
+                continue
+            orig = comp.reference
+            placed = ref_map.get(orig, orig)
+            tagged[orig] = bank_id
+            tagged[placed] = bank_id
+            try:
+                pitch_mm = float(props.get("resistor_bank_pitch", 7.62))
+            except (TypeError, ValueError):
+                pitch_mm = 7.62
+            meta[bank_id] = {
+                "pitch_mm": pitch_mm,
+                "common": props.get("resistor_bank_common"),
+                "side": (props.get("resistor_bank_side") or "auto").lower(),
+            }
+            # Drop the directive properties so they don't render as symbol fields.
+            sym = self.component_manager.find_component(placed)
+            for tag in (
+                "resistor_bank",
+                "resistor_bank_pitch",
+                "resistor_bank_common",
+                "resistor_bank_side",
+            ):
+                if (
+                    sym is not None
+                    and getattr(sym, "properties", None)
+                    and tag in sym.properties
+                ):
+                    del sym.properties[tag]
+                props.pop(tag, None)
+
+        if not tagged:
+            return
+
+        circuit_nets = (
+            self.circuit.nets.values()
+            if isinstance(self.circuit.nets, dict)
+            else self.circuit.nets
+        )
+        bank_pins = {}  # bank_id -> {placed_ref -> {pin -> net_name}}
+        orig_of = {}    # bank_id -> {placed_ref -> connection_ref (for suppress)}
+        for net in circuit_nets:
+            for comp_ref, pin in net.connections:
+                bank_id = tagged.get(comp_ref)
+                if not bank_id:
+                    continue
+                placed = ref_map.get(comp_ref, comp_ref)
+                bank_pins.setdefault(bank_id, {}).setdefault(placed, {})[
+                    str(pin)
+                ] = net.name
+                orig_of.setdefault(bank_id, {})[placed] = comp_ref
+
+        for bank_id, refs in bank_pins.items():
+            common = meta[bank_id]["common"]
+            common_pin = {}  # placed_ref -> common pin id ("1"/"2")
+            for placed, pins in refs.items():
+                hits = [p for p, n in pins.items() if n == common]
+                if len(hits) != 1:
+                    raise ValueError(
+                        f"resistor_bank '{bank_id}': {placed} touches common "
+                        f"'{common}' on {len(hits)} pin(s) (pins={pins}); each "
+                        f"member must straddle the rail exactly once"
+                    )
+                common_pin[placed] = hits[0]
+
+            side = meta[bank_id]["side"]
+            if side not in ("top", "bottom"):
+                up = str(common).upper()
+                side = "bottom" if ("GND" in up or "VSS" in up) else "top"
+
+            ordered = sorted(refs.keys(), key=_ref_sort_key)
+            self._resistor_banks[bank_id] = {
+                "refs": ordered,
+                "pitch_mm": meta[bank_id]["pitch_mm"],
+                "common": common,
+                "side": side,
+                "common_pin": common_pin,
+            }
+            for placed in ordered:
+                self._resistor_bank_suppress.add(
+                    (orig_of[bank_id][placed], common_pin[placed])
+                )
+            logger.info(
+                f"resistor_bank '{bank_id}': {len(refs)} resistors on common "
+                f"'{common}' (rail {side})"
+            )
+
+    def _layout_resistor_banks(self):
+        """Re-lay each bank's resistors into a tight row, common pin facing the rail.
+
+        Device:R at rotation 0 has pin 1 up / pin 2 down. To put the common pin on
+        the rail side regardless of which pin carries it, each resistor is rotated
+        0 or 180 so every common pin lands on the same rail line.
+        """
+        for bank_id, bank in getattr(self, "_resistor_banks", {}).items():
+            refs = bank["refs"]
+            syms = [(r, self.component_manager.find_component(r)) for r in refs]
+            syms = [(r, s) for r, s in syms if s is not None]
+            if len(syms) < 2:
+                continue
+            pitch = bank["pitch_mm"]
+            top = bank["side"] == "top"
+            x0, y0 = syms[0][1].position.x, syms[0][1].position.y
+            for i, (ref, sym) in enumerate(syms):
+                cx = x0 + i * pitch
+                cpin = bank["common_pin"].get(ref, "1")
+                if top:
+                    rot = 0.0 if cpin == "1" else 180.0
+                else:
+                    rot = 0.0 if cpin == "2" else 180.0
+                sym.position = Point(cx, y0)
+                sym.rotation = rot
+                self._style_bank_text(sym, cx, y0)
+
+    def _draw_resistor_bank_rails(self):
+        """Draw the single shared rail for each bank, with one common-net marker."""
+        self._rail_pwr_counter = getattr(self, "_rail_pwr_counter", 1)
+        for bank_id, bank in getattr(self, "_resistor_banks", {}).items():
+            refs = bank["refs"]
+            syms = [(r, self.component_manager.find_component(r)) for r in refs]
+            syms = [(r, s) for r, s in syms if s is not None]
+            if len(syms) < 2:
+                continue
+            cp = [self._pin_xy(s, bank["common_pin"].get(r, "1")) for r, s in syms]
+            if any(p is None for p in cp):
+                logger.warning(
+                    f"resistor_bank '{bank_id}': missing pin positions; skipping rail."
+                )
+                continue
+            rail_y = cp[0][1]
+            xs = [p[0] for p in cp]
+            x_lo, x_hi = min(xs), max(xs)
+            # Overhang the rail by one pitch so the net marker gets a clear column
+            # away from the leftmost resistor's (now vertical) field text.
+            ext = max(2.54, bank["pitch_mm"])
+            self._append_rail_wire(x_lo - ext, rail_y, x_hi, rail_y)
+            # A pin mid-wire only connects in KiCad with a junction on it.
+            for px, _ in cp:
+                self._append_junction(px, rail_y)
+            # Exactly one net marker for the rail, at the extended (left) end.
+            self._add_rail_marker(bank["common"], x_lo - ext, rail_y)
+            logger.info(
+                f"resistor_bank '{bank_id}': drew 1 rail for {len(syms)} resistors "
+                f"({bank['common']})"
             )
 
     def _append_rail_wire(self, x1, y1, x2, y2):

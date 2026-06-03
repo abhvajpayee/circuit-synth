@@ -106,6 +106,7 @@ from .core import (
     ServiceLocator,
     ValidationError,
     cap_bank,
+    resistor_bank,
     circuit,
     find_replaceable_components,
     replace_components,
@@ -180,6 +181,7 @@ __all__ = [
     "Pin",
     "circuit",
     "cap_bank",
+    "resistor_bank",
     # Component replacement
     "replace_components",
     "replace_multiple",
