@@ -6,10 +6,14 @@ pass draws a real vector bus on whichever sheet(s) carry the members:
 
 * **Plain** bus (``FMC_D[0..15]``) — one tap per member, on the first sheet that
   has the members.
-* **Aliased** bus (``SPI_[0..3]``) — a **dual label** per tap: the positional
-  member ``SPI_0`` *and* the explanatory ``SPI_MISO`` on the same stub, which
-  translates the flat net onto a readable name. Drawn on **every** sheet a
-  member appears, so the translation is uniform across the design.
+* **Aliased** bus (``SPI_[0..3]``) — each component pin is **retext**ed to the
+  elaborated member name (``SPI_SCK``) so the schematic reads by signal, while the
+  bus stub keeps the numeric positional name (``SPI_0``) as the vector-bus tie. The
+  tap therefore carries a **dual label** (``SPI_0`` + ``SPI_SCK`` on the same stub),
+  tying the elaborated pin net to the numeric bus member. Drawn on **every** sheet a
+  member appears, so the translation is uniform across the design. The net stays a
+  numeric vector member (canonical net name remains ``SPI_0``); only the labels at
+  the pins change, so connectivity is identical.
 
 **Hierarchical-bus conversion.** When a bus is cross-sheet — i.e. any member is
 a *hierarchical* label (circuit-synth promotes sibling-shared nets to
@@ -90,6 +94,17 @@ def _demote(txt, member):
                   f'\t(label "{member}"\n', txt)
 
 
+def _retext_pin_labels(txt, positional, elaborated):
+    """Rename a member's per-pin labels from the positional bus name (``SPI_0``) to
+    the elaborated alias (``SPI_SCK``), so components read by name. Run *before* the
+    bus block is spliced, when the only labels named ``positional`` on the sheet are
+    the component-pin ones; the numeric positional label is re-added on the bus stub
+    (by the tap) as the vector-bus tie, so connectivity is unchanged -- the alias net
+    ties to the numeric bus member there."""
+    return re.sub(r'\(label "' + re.escape(positional) + r'"',
+                  f'(label "{elaborated}"', txt)
+
+
 def _parent_surgery(txt, members, bus_label):
     """On the parent sheet, collapse the per-member sheet pins on each child
     symbol into one bus pin, and the per-member tie labels into one bus label."""
@@ -158,6 +173,11 @@ def inject_buses(project_dir, buses):
             if hierarchical:
                 for i in present:
                     t = _demote(t, members[i])
+            if aliased:
+                # Elaborated name at each component pin; the numeric positional name
+                # stays only on the bus stub (added by the tap) as the vector tie.
+                for i in present:
+                    t = _retext_pin_labels(t, members[i], alias[i])
             sheets[n] = _splice(t, block)
             injected.append((bus.label, n))
 
