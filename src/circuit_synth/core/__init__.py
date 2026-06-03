@@ -17,10 +17,12 @@ from .dependency_injection import (
     ServiceLocator,
 )
 from .exception import CircuitSynthError, ComponentError, ValidationError
+from .bus import Bus
 from .net import Net
 from .pin import Pin
 
 __all__ = [
+    "Bus",
     "Circuit",
     "Component",
     "Net",

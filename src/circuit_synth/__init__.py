@@ -93,6 +93,7 @@ from .ai_integration.plugins import AIDesignBridge
 # Exception imports
 # Core imports
 from .core import (
+    Bus,
     Circuit,
     CircuitSynthError,
     Component,
@@ -170,6 +171,7 @@ def setup_claude_integration():
 from .kicad.core import Junction, Label, Schematic, SchematicSymbol, Wire
 
 __all__ = [
+    "Bus",
     # Core
     "Circuit",
     "Component",

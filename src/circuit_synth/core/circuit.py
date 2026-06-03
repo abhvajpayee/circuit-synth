@@ -21,6 +21,7 @@ class Circuit:
         self.auto_comments = auto_comments
         self._components = {}
         self._nets = {}
+        self._buses = []  # Bus objects declared in this circuit (for bus graphics)
         # self._unnamed_net_counter = 1 # Removed: Counter is now managed by ReferenceManager
         self._parent = None
         self._subcircuits = []
@@ -39,6 +40,17 @@ class Circuit:
     def register_reference(self, ref: str) -> None:
         """Register a new reference in this circuit's scope"""
         self._reference_manager.register_reference(ref)
+
+    def add_bus(self, bus):
+        """Register a Bus declared in this circuit (used to draw bus graphics)."""
+        self._buses.append(bus)
+
+    def _all_buses(self):
+        """All buses declared in this circuit and its subcircuits (recursive)."""
+        out = list(self._buses)
+        for sc in self._subcircuits:
+            out.extend(sc._all_buses())
+        return out
 
     def add_subcircuit(self, subcirc: "Circuit"):
         """Add a subcircuit and establish parent-child relationship"""
@@ -775,6 +787,22 @@ class Circuit:
                     project_name=project_name,
                     output_path=str(output_path),
                 )
+                # Draw graphical vector buses for any declared Bus objects.
+                try:
+                    buses = self._all_buses()
+                    if buses:
+                        from ..kicad.schematic.bus_emit import inject_buses
+
+                        done = inject_buses(output_path, buses)
+                        context_logger.info(
+                            f"Injected {len(done)} bus graphic(s): {done}",
+                            component="CIRCUIT",
+                        )
+                except Exception as e:  # bus drawing is best-effort, never fatal
+                    context_logger.warning(
+                        f"Bus graphic injection skipped: {e}", component="CIRCUIT"
+                    )
+
                 # Return success result with JSON path
                 return {
                     "success": True,
