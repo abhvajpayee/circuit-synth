@@ -267,6 +267,16 @@ def validate_arc_geometry(start, mid, end):
     return True, mid
 
 
+def _ref_sort_key(ref):
+    """Natural sort key for references (so C2 sorts before C10)."""
+    import re
+
+    ref = ref or ""
+    m = re.search(r"(\d+)$", ref)
+    prefix = re.sub(r"\d+$", "", ref)
+    return (prefix, int(m.group(1)) if m else 0)
+
+
 class SchematicWriter:
     """
     Builds a KiCad schematic using the new KiCad API.
@@ -435,6 +445,11 @@ class SchematicWriter:
         place_time = time.perf_counter() - place_start
         logger.info(f"✅ STEP 2/8: Components placed in {place_time*1000:.2f}ms")
 
+        # Cap banks: collect tagged caps and re-lay them into tight rows before
+        # labels are generated (suppression set must exist for STEP 3).
+        self._collect_cap_banks()
+        self._layout_cap_banks()
+
         # Add pin-level net labels
         labels_start = time.perf_counter()
         logger.info(
@@ -443,6 +458,9 @@ class SchematicWriter:
         component_labels = self._add_pin_level_net_labels()
         labels_time = time.perf_counter() - labels_start
         logger.info(f"✅ STEP 3/8: Net labels added in {labels_time*1000:.2f}ms")
+
+        # Cap banks: draw the two shared rails + one net marker per rail.
+        self._draw_cap_bank_rails()
         logger.debug(
             f"  Label tracking: {len(component_labels)} components with labels"
         )
@@ -1359,6 +1377,13 @@ class SchematicWriter:
                 # Don't use reference mapping here - net connections have already been updated
                 actual_ref = comp_ref
 
+                # Cap-bank pins are wired by shared rails (drawn in
+                # _draw_cap_bank_rails), so suppress their per-pin marker here.
+                if (actual_ref, str(pin_identifier)) in getattr(
+                    self, "_cap_bank_suppress", ()
+                ):
+                    continue
+
                 # Find component using the API
                 comp = self.component_manager.find_component(actual_ref)
 
@@ -1557,6 +1582,294 @@ class SchematicWriter:
                 )
 
         return component_labels
+
+    # ---------------------------------------------------------- cap banks ----
+    def _collect_cap_banks(self):
+        """Group cap-bank-tagged caps and build the per-pin label suppression set.
+
+        Reads the ``cap_bank`` / ``cap_bank_pitch`` properties off the loaded
+        components (set by :func:`circuit_synth.cap_bank`), determines each bank's
+        two shared nets (pin ``1`` -> positive rail, pin ``2`` -> return rail), and
+        records which ``(ref, pin)`` markers the label step must skip. The directive
+        properties are stripped so they do not surface as symbol fields. A bank whose
+        caps do not share exactly two nets is left as ordinary individual caps.
+        """
+        self._cap_banks = {}
+        self._cap_bank_suppress = set()
+
+        tagged = {}  # any ref form -> bank_id
+        pitch_by_bank = {}
+        ref_map = getattr(self, "reference_mapping", {}) or {}
+        for comp in self.circuit.components:
+            props = getattr(comp, "properties", None) or {}
+            bank_id = props.get("cap_bank")
+            if not bank_id:
+                continue
+            orig = comp.reference
+            placed = ref_map.get(orig, orig)
+            tagged[orig] = bank_id
+            tagged[placed] = bank_id
+            try:
+                pitch_by_bank[bank_id] = float(props.get("cap_bank_pitch", 3.81))
+            except (TypeError, ValueError):
+                pitch_by_bank[bank_id] = 3.81
+            # Drop the directive properties so they don't render as symbol fields.
+            sym = self.component_manager.find_component(placed)
+            for tag in ("cap_bank", "cap_bank_pitch"):
+                if (
+                    sym is not None
+                    and getattr(sym, "properties", None)
+                    and tag in sym.properties
+                ):
+                    del sym.properties[tag]
+                props.pop(tag, None)
+
+        if not tagged:
+            return
+
+        circuit_nets = (
+            self.circuit.nets.values()
+            if isinstance(self.circuit.nets, dict)
+            else self.circuit.nets
+        )
+        bank_pins = {}       # bank_id -> {placed_ref -> {pin -> net_name}}
+        bank_suppress = {}   # bank_id -> set((ref-in-connections, pin))
+        for net in circuit_nets:
+            for comp_ref, pin in net.connections:
+                bank_id = tagged.get(comp_ref)
+                if not bank_id:
+                    continue
+                placed = ref_map.get(comp_ref, comp_ref)
+                bank_pins.setdefault(bank_id, {}).setdefault(placed, {})[
+                    str(pin)
+                ] = net.name
+                bank_suppress.setdefault(bank_id, set()).add((comp_ref, str(pin)))
+
+        for bank_id, refs in bank_pins.items():
+            pos_nets = {pins.get("1") for pins in refs.values()}
+            neg_nets = {pins.get("2") for pins in refs.values()}
+            if (
+                len(pos_nets) != 1
+                or len(neg_nets) != 1
+                or None in pos_nets
+                or None in neg_nets
+            ):
+                logger.warning(
+                    f"cap_bank '{bank_id}': caps must share exactly two nets "
+                    f"(pin1={pos_nets}, pin2={neg_nets}); leaving as individual caps."
+                )
+                continue
+            self._cap_banks[bank_id] = {
+                "refs": sorted(refs.keys(), key=_ref_sort_key),
+                "pitch_mm": pitch_by_bank.get(bank_id, 3.81),
+                "pos_net": next(iter(pos_nets)),
+                "neg_net": next(iter(neg_nets)),
+            }
+            self._cap_bank_suppress |= bank_suppress.get(bank_id, set())
+            logger.info(
+                f"cap_bank '{bank_id}': {len(refs)} caps on "
+                f"{next(iter(pos_nets))}/{next(iter(neg_nets))}"
+            )
+
+    def _layout_cap_banks(self):
+        """Re-lay each bank's caps into a tight horizontal row at the bank pitch."""
+        for bank_id, bank in getattr(self, "_cap_banks", {}).items():
+            syms = [self.component_manager.find_component(r) for r in bank["refs"]]
+            syms = [s for s in syms if s is not None]
+            if len(syms) < 2:
+                continue
+            pitch = bank["pitch_mm"]
+            x0, y0 = syms[0].position.x, syms[0].position.y
+            for i, sym in enumerate(syms):
+                cx = x0 + i * pitch
+                sym.position = Point(cx, y0)
+                sym.rotation = 0.0
+                self._style_bank_text(sym, cx, y0)
+
+    def _style_bank_text(self, sym, cx, cy):
+        """Rotate a bank cap's Value/Reference text to vertical so long value
+        strings stack within the cap's column instead of colliding at tight pitch."""
+        try:
+            sym.fields_autoplaced = False
+        except Exception:
+            pass
+        # Value reads bottom-to-top just left of the cap body; reference just right.
+        try:
+            sym.set_property_effects(
+                "Value",
+                {"rotation": 90.0, "position": (cx - 1.27, cy), "justify_h": "left"},
+            )
+            sym.set_property_effects(
+                "Reference",
+                {"rotation": 90.0, "position": (cx + 1.27, cy), "justify_h": "left"},
+            )
+        except Exception as e:
+            logger.warning(f"cap_bank: could not rotate field text for {sym}: {e}")
+
+    def _pin_xy(self, comp, pin_identifier):
+        """Absolute (x, y) of a component pin tip, matching the label placement math
+        in _add_pin_level_net_labels (no mirror dependency)."""
+        lib_data = SymbolLibCache.get_symbol_data(comp.lib_id)
+        if not lib_data or "pins" not in lib_data:
+            return None
+        pin_dict = find_pin_by_identifier(lib_data["pins"], pin_identifier)
+        if not pin_dict:
+            return None
+        anchor_x = float(pin_dict.get("x", 0.0))
+        anchor_y = float(pin_dict.get("y", 0.0))
+        r = math.radians(comp.rotation)
+        local_x, local_y = anchor_x, -anchor_y
+        rx = (local_x * math.cos(r)) - (local_y * math.sin(r))
+        ry = (local_x * math.sin(r)) + (local_y * math.cos(r))
+        return (comp.position.x + rx, comp.position.y + ry)
+
+    def _draw_cap_bank_rails(self):
+        """Draw the two shared rails for each bank, one net marker per rail."""
+        self._rail_pwr_counter = getattr(self, "_rail_pwr_counter", 1)
+        for bank_id, bank in getattr(self, "_cap_banks", {}).items():
+            syms = [self.component_manager.find_component(r) for r in bank["refs"]]
+            syms = [s for s in syms if s is not None]
+            if len(syms) < 2:
+                continue
+            p1 = [self._pin_xy(s, "1") for s in syms]
+            p2 = [self._pin_xy(s, "2") for s in syms]
+            if any(p is None for p in p1 + p2):
+                logger.warning(
+                    f"cap_bank '{bank_id}': missing pin positions; skipping rails."
+                )
+                continue
+            y1, y2 = p1[0][1], p2[0][1]
+            xs = [p[0] for p in p1] + [p[0] for p in p2]
+            x_lo, x_hi = min(xs), max(xs)
+            # Overhang the rail by one pitch so each net marker gets its own clear
+            # column, away from the leftmost cap's (now vertical) field text.
+            ext = max(2.54, bank["pitch_mm"])
+            # Rails run horizontally through the pin tips (all colinear after layout).
+            self._append_rail_wire(x_lo - ext, y1, x_hi, y1)
+            self._append_rail_wire(x_lo - ext, y2, x_hi, y2)
+            # A pin that lands mid-rail only connects in KiCad if a junction sits on
+            # it; drop one at every cap pin tip on both rails.
+            for px, _ in p1:
+                self._append_junction(px, y1)
+            for px, _ in p2:
+                self._append_junction(px, y2)
+            # Exactly one net marker per rail, at the extended (left) end.
+            self._add_rail_marker(bank["pos_net"], x_lo - ext, y1)
+            self._add_rail_marker(bank["neg_net"], x_lo - ext, y2)
+            logger.info(
+                f"cap_bank '{bank_id}': drew 2 rails for {len(syms)} caps "
+                f"({bank['pos_net']} / {bank['neg_net']})"
+            )
+
+    def _append_rail_wire(self, x1, y1, x2, y2):
+        """Append a straight rail wire to the schematic _data (same path as labels)."""
+        if not hasattr(self.schematic, "_data"):
+            self.schematic.wires.append(
+                Wire(
+                    uuid=str(uuid_module.uuid4()),
+                    points=[Point(x1, y1), Point(x2, y2)],
+                )
+            )
+            return
+        self.schematic._data.setdefault("wires", []).append(
+            {
+                "uuid": str(uuid_module.uuid4()),
+                "points": [{"x": x1, "y": y1}, {"x": x2, "y": y2}],
+                "stroke_width": 0,
+                "stroke_type": "default",
+            }
+        )
+
+    def _append_junction(self, x, y):
+        """Append a junction dot to the schematic _data."""
+        if not hasattr(self.schematic, "_data"):
+            return
+        self.schematic._data.setdefault("junctions", []).append(
+            {"uuid": str(uuid_module.uuid4()), "position": {"x": x, "y": y}}
+        )
+
+    def _find_net(self, name):
+        nets = (
+            self.circuit.nets.values()
+            if isinstance(self.circuit.nets, dict)
+            else self.circuit.nets
+        )
+        for n in nets:
+            if n.name == name:
+                return n
+        return None
+
+    def _add_rail_marker(self, net_name, x, y):
+        """Place exactly one net marker on a rail (power symbol for power nets,
+        else a single net label) so the rail ties into the global net by name."""
+        net = self._find_net(net_name)
+        if (
+            net is not None
+            and getattr(net, "is_power", False)
+            and getattr(net, "power_symbol", None)
+        ):
+            ref = f"#PWR9{self._rail_pwr_counter:02d}"
+            self._rail_pwr_counter += 1
+            self._add_power_symbol(
+                lib_id=net.power_symbol,
+                reference=ref,
+                value=net_name,
+                position=(x, y),
+                rotation=0.0,
+            )
+            return
+        is_hier = self._is_net_hierarchical(net) if net is not None else False
+        # The marker sits at the LEFT end of a rail that runs to the right. A
+        # hierarchical label anchors on the opposite side from a local label, so at
+        # 0deg its arrow/text would point into the bank; 180deg makes it read away
+        # from the caps with the connection point still on the rail.
+        angle = 180.0 if is_hier else 0.0
+        self._append_net_label(net_name, x, y, hierarchical=is_hier, angle=angle)
+
+    def _append_net_label(self, net_name, x, y, hierarchical, angle=0.0):
+        """Append a single net label to the schematic _data (rail marker)."""
+        from ..schematic.label_utils import calculate_hierarchical_label_justify
+
+        label_type = LabelType.HIERARCHICAL if hierarchical else LabelType.LOCAL
+        label = Label(
+            uuid=str(uuid_module.uuid4()),
+            position=Point(x, y),
+            text=net_name,
+            label_type=label_type,
+            rotation=float(angle),
+        )
+        justify = calculate_hierarchical_label_justify(angle)
+        if not hasattr(self.schematic, "_data"):
+            self.schematic.labels.append(label)
+            return
+        if label_type == LabelType.HIERARCHICAL:
+            self.schematic._data.setdefault("hierarchical_labels", []).append(
+                {
+                    "uuid": label.uuid,
+                    "position": {"x": x, "y": y},
+                    "text": net_name,
+                    "rotation": float(angle),
+                    "size": label.size,
+                    "shape": label.shape if label.shape else "input",
+                    "justify": justify,
+                }
+            )
+        else:
+            self.schematic._data.setdefault("labels", []).append(
+                {
+                    "uuid": label.uuid,
+                    "position": {"x": x, "y": y},
+                    "text": net_name,
+                    "label_type": (
+                        label_type.value
+                        if hasattr(label_type, "value")
+                        else label_type
+                    ),
+                    "rotation": float(angle),
+                    "size": label.size,
+                    "justify_h": justify,
+                }
+            )
 
     def _add_subcircuit_sheets(self):
         """

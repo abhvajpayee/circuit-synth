@@ -18,6 +18,7 @@ from .dependency_injection import (
 )
 from .exception import CircuitSynthError, ComponentError, ValidationError
 from .bus import Bus
+from .cap_bank import cap_bank
 from .net import Net
 from .pin import Pin
 
@@ -28,6 +29,7 @@ __all__ = [
     "Net",
     "Pin",
     "circuit",
+    "cap_bank",
     "ComponentError",
     "ValidationError",
     "CircuitSynthError",
