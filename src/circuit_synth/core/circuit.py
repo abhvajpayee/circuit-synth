@@ -803,6 +803,10 @@ class Circuit:
                         f"Bus graphic injection skipped: {e}", component="CIRCUIT"
                     )
 
+                # Post-process: fix sheet symbol sizes, split pins left/right,
+                # convert root hierarchical_labels to net labels.
+                _postprocess_schematic(output_path, project_base_name, context_logger)
+
                 # Return success result with JSON path
                 return {
                     "success": True,
@@ -819,6 +823,8 @@ class Circuit:
                     project_name=project_name,
                     error=error_msg,
                 )
+                # Still try post-processing — schematic may be valid even if PCB failed
+                _postprocess_schematic(output_path, project_base_name, context_logger)
                 return {
                     "success": False,
                     "error": error_msg,
@@ -829,6 +835,8 @@ class Circuit:
         except ImportError as e:
             error_msg = f"KiCad integration not available: {e}"
             context_logger.error(error_msg, component="CIRCUIT")
+            # Schematic was still generated; do post-processing even though PCB failed.
+            _postprocess_schematic(output_path, project_base_name, context_logger)
             return {
                 "success": False,
                 "error": error_msg,
@@ -838,6 +846,7 @@ class Circuit:
             context_logger.error(
                 error_msg, component="CIRCUIT", project_name=project_name
             )
+            _postprocess_schematic(output_path, project_base_name, context_logger)
             return {
                 "success": False,
                 "error": error_msg,
@@ -1314,3 +1323,35 @@ class Circuit:
             Dict[str, Net]: Dictionary of nets keyed by net name
         """
         return self._nets
+
+
+def _postprocess_schematic(
+    output_path: Any, project_base_name: Any,
+    context_logger: Any,  # actually a structlog/logger adapter
+) -> None:
+    """Run fix_sheet_symbol_sizes and fix_subsheet_labels on the top-level schematic.
+
+    Best-effort: silently no-ops if output_path or project_base_name are not
+    available (e.g. exception before they were defined).
+    """
+    try:
+        if output_path is None or project_base_name is None:
+            return
+        top_sch = Path(output_path) / f"{project_base_name}.kicad_sch"
+        if not top_sch.exists():
+            return
+        from circuit_synth.kicad.sch_postprocess import (
+            fix_sheet_symbol_sizes,
+            fix_subsheet_labels,
+        )
+        fix_sheet_symbol_sizes(str(top_sch))
+        fix_subsheet_labels(str(top_sch))
+        context_logger.info(
+            f"Schematic post-processing complete: {top_sch}",
+            component="CIRCUIT",
+        )
+    except Exception as e:
+        context_logger.warning(
+            f"Schematic post-processing skipped: {e}",
+            component="CIRCUIT",
+        )
