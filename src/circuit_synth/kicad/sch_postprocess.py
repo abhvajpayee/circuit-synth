@@ -76,10 +76,29 @@ def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
         raw_h  = MARGIN_TOP + (n_left - 1) * PIN_PITCH + MARGIN_BOT
         new_h  = math.ceil(raw_h / PIN_PITCH) * PIN_PITCH  # snap to grid
 
+        # A tie label's CURRENT x may be either edge, not just old_right_x:
+        # the module docstring's "pins are emitted on the right side only"
+        # describes the base writer's *first-ever* output, but any pin that
+        # was classified LEFT (x=sx) on some earlier regeneration has its tie
+        # label sitting at sx, not old_right_x -- e.g. the pin/member set
+        # shrank or grew and the alphabetical left/right split boundary
+        # (n_left) shifted, moving a given name from the left half to the
+        # right half or vice versa between runs. Registering both possible
+        # incoming x's under the same target keeps the lookup below correct
+        # regardless of which side the pin's tie was on last time. Found on
+        # the acquisition board 2026-07-08: ETH_TX_EN's tie label was frozen
+        # at the MCU sheet's LEFT edge from an earlier run while the pin
+        # itself is now on the RIGHT -- with only old_right_x registered, the
+        # label was never found and the net was effectively disconnected on
+        # the root sheet (no coincident tie at the pin's real position).
         for k, name in enumerate(pin_names[:n_left]):
-            label_updates[(old_right_x, name)] = (sx, sy + MARGIN_TOP + k * PIN_PITCH, 180)
+            target = (sx, sy + MARGIN_TOP + k * PIN_PITCH, 180)
+            label_updates[(old_right_x, name)] = target
+            label_updates[(sx, name)] = target
         for k, name in enumerate(pin_names[n_left:]):
-            label_updates[(old_right_x, name)] = (sx + cur_w, sy + MARGIN_TOP + k * PIN_PITCH, 0)
+            target = (sx + cur_w, sy + MARGIN_TOP + k * PIN_PITCH, 0)
+            label_updates[(old_right_x, name)] = target
+            label_updates[(sx, name)] = target
 
         # Rewrite sheet block
         new_sheetfile_y = sy + new_h + LABEL_OFFSET
@@ -95,7 +114,12 @@ def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
                 new_block.append(ln); continue
             if in_sf:
                 sf_depth += ln.count('(') - ln.count(')')
-                m = re.match(r'(\t\t\t\(at\s+)([\d.+-]+)\s+([\d.+-]+)(\s+\d+\))', ln)
+                # Angle group accepts decimals too ("0.0000"/"180.0000"), the
+                # format kicad_sch_api's own formatter always emits on resave
+                # -- an integer-only `\d+` here silently fails to match and
+                # leaves this label's Y position stale (see the pin-position
+                # comment below for the more serious sibling of this bug).
+                m = re.match(r'(\t\t\t\(at\s+)([\d.+-]+)\s+([\d.+-]+)(\s+[\d.+-]+\))', ln)
                 if m:
                     ln = f'{m.group(1)}{m.group(2)} {new_sheetfile_y:.4f}{m.group(4)}\n'
                 if sf_depth == 0: in_sf = False
@@ -107,7 +131,22 @@ def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
                 new_block.append(ln); continue
             if in_pin:
                 pin_depth += ln.count('(') - ln.count(')')
-                m = re.match(r'(\t\t\t\(at\s+)([\d.+-]+)\s+([\d.+-]+)(\s+)(\d+)(\))', ln)
+                # Angle group must accept decimals ("0.0000"/"180.0000"), not
+                # just a bare integer ("0"/"180"). kicad_sch_api's own
+                # formatter always writes the decimal form when it resaves a
+                # file (e.g. an unrelated incremental-sync edit elsewhere in
+                # the project triggers a full round-trip through its object
+                # model). An integer-only `\d+` here silently fails to match
+                # any pin whose incoming angle is already decimal -- so its
+                # left_idx/right_idx slot counter never advances and its
+                # coordinates are never rewritten, freezing it at a stale
+                # position. Across repeated regenerations (pin count shifting
+                # as bus-member collapsing removes pins, changing n_left) this
+                # produced two *different* pins landing on the exact same
+                # coordinate -- a real position collision on the sheet
+                # symbol, found on the acquisition board's MCU sheet
+                # 2026-07-08 (GND and SDMMC_[0..10] both at (63.5, 22.86)).
+                m = re.match(r'(\t\t\t\(at\s+)([\d.+-]+)\s+([\d.+-]+)(\s+)([\d.+-]+)(\))', ln)
                 if m:
                     if is_left:
                         nx, ny, na = sx, sy + MARGIN_TOP + left_idx * PIN_PITCH, 180
@@ -182,6 +221,57 @@ def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
                     ln = f'\t\t\t(justify {new_justify})\n'
                 new_hl.append(ln)
             out.append(''.join(new_hl))
+            continue
+
+        # A root sheet (no parent of its own) ties sibling sheet-symbol pins
+        # together with plain, coincident-point `label`s rather than
+        # hierarchical_labels (see bus_emit.py's _parent_surgery). Those tie
+        # labels must track a sheet pin's position the same way a
+        # hierarchical_label does above -- otherwise, once this pass moves a
+        # pin to its freshly recomputed grid slot, the (unmoved) tie label is
+        # stranded at the pin's OLD coordinate and collides with whatever
+        # *different* pin the fresh grid now assigns to that same spot. Found
+        # on the acquisition board 2026-07-08 as a second-order effect of
+        # fixing the bus-connectivity bug: MCU/WiFi/Storage's bus-vector tie
+        # labels (SDMMC_[0..10], SD_[0..5], SPI_[0..3], UART_[0..1]) went
+        # stale and collided with newly-repositioned scalar pins (GND, SD_CD,
+        # WIFI_CHEN, WIFI_BOOT).
+        if re.match(r'\t\(label\s+"', lines[i]):
+            lbl_block = [lines[i]]
+            i += 1; depth = 1
+            while i < len(lines) and depth > 0:
+                depth += lines[i].count('(') - lines[i].count(')')
+                lbl_block.append(lines[i]); i += 1
+
+            name_m = re.match(r'\t\(label\s+"([^"]+)"', lbl_block[0])
+            lbl_name = name_m.group(1) if name_m else None
+            at_line_idx = None; at_x = at_y = at_angle = None
+            for j, ln in enumerate(lbl_block):
+                m = re.match(r'\t\t\(at\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\)', ln)
+                if m:
+                    at_line_idx = j
+                    at_x, at_y, at_angle = float(m.group(1)), float(m.group(2)), float(m.group(3))
+                    break
+
+            update = None
+            if lbl_name is not None and at_x is not None:
+                for (kx, kn), v in label_updates.items():
+                    if kn == lbl_name and abs(kx - at_x) < 0.01:
+                        update = v; break
+
+            if update is not None:
+                final_x, final_y, final_angle = update[0], update[1], float(update[2])
+                new_justify = 'right bottom' if abs(final_angle - 180.0) < 1 else 'left bottom'
+                new_lbl: list[str] = []
+                for j, ln in enumerate(lbl_block):
+                    if at_line_idx is not None and j == at_line_idx:
+                        ln = f'\t\t(at {final_x:.4f} {final_y:.4f} {final_angle:.4f})\n'
+                    elif re.match(r'\t\t\t\(justify\s+', ln):
+                        ln = f'\t\t\t(justify {new_justify})\n'
+                    new_lbl.append(ln)
+                out.append(''.join(new_lbl))
+            else:
+                out.append(''.join(lbl_block))
             continue
 
         out.append(lines[i]); i += 1

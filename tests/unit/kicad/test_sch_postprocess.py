@@ -49,7 +49,26 @@ def _pin_block(name: str, x: float, y: float, angle: int = 0) -> str:
     )
 
 
-def _sheet(pins: list[str]) -> str:
+def _pin_block_decimal_angle(name: str, x: float, y: float, angle: float = 0.0) -> str:
+    """Same as _pin_block, but the angle is serialized with 4 decimal places
+    (e.g. "0.0000"/"180.0000") -- the shape kicad_sch_api's own formatter
+    produces whenever it resaves a file (e.g. during an unrelated incremental
+    sync elsewhere in the project), as opposed to the plain-integer angle
+    ("0"/"180") this module's own rewrite path emits. Reproduces the exact
+    real-world precondition found on the acquisition board 2026-07-08."""
+    justify = "right" if angle == 0 else "left"
+    return (
+        f'\t\t(pin "{name}" input\n'
+        f'\t\t\t(at {x:.4f} {y:.4f} {angle:.4f})\n'
+        '\t\t\t(effects\n'
+        '\t\t\t\t(font (size 1.27 1.27))\n'
+        f'\t\t\t\t(justify {justify})\n'
+        '\t\t\t)\n'
+        '\t\t)\n'
+    )
+
+
+def _sheet(pins: list[str], decimal_angle: bool = False) -> str:
     """Minimal sheet block with all pins placed on the right side."""
     sheetfile_y = _SY + _OLD_H + 0.7116
     body = (
@@ -60,11 +79,30 @@ def _sheet(pins: list[str]) -> str:
         f'\t\t\t(at {_SX:.4f} {sheetfile_y:.4f} 0)\n'
         '\t\t)\n'
     )
+    builder = _pin_block_decimal_angle if decimal_angle else _pin_block
     for k, name in enumerate(pins):
         py = _SY + 2.54 + k * 2.54
-        body += _pin_block(name, _OLD_RIGHT_X, py, angle=0)
+        body += builder(name, _OLD_RIGHT_X, py, angle=0.0 if decimal_angle else 0)
     body += '\t)\n'
     return body
+
+
+def _plain_label(name: str, x: float, y: float, angle: float = 0.0) -> str:
+    """A root-sheet plain tie label -- the mechanism a TRUE root (no parent of
+    its own) uses to tie sibling sheet-symbol pins together, per
+    bus_emit.py's _parent_surgery. Structurally like _hl but `label` instead
+    of `hierarchical_label`, and no `shape` line."""
+    justify = "right bottom" if abs(angle - 180.0) < 1 else "left bottom"
+    return (
+        f'\t(label "{name}"\n'
+        f'\t\t(at {x:.4f} {y:.4f} {angle:.4f})\n'
+        '\t\t(effects\n'
+        '\t\t\t(font (size 1.27 1.27))\n'
+        f'\t\t\t(justify {justify})\n'
+        '\t\t)\n'
+        '\t\t(uuid "11111111-1111-1111-1111-111111111111")\n'
+        '\t)\n'
+    )
 
 
 def _hl(name: str, x: float, y: float, angle: float = 0.0) -> str:
@@ -81,7 +119,7 @@ def _hl(name: str, x: float, y: float, angle: float = 0.0) -> str:
     )
 
 
-def _top(pins: list[str]) -> str:
+def _top(pins: list[str], decimal_angle: bool = False) -> str:
     """Top-level schematic: one sheet + one HL per pin (all initially on right)."""
     hls = ''.join(
         _hl(name, _OLD_RIGHT_X, _SY + 2.54 + k * 2.54, angle=0.0)
@@ -89,7 +127,7 @@ def _top(pins: list[str]) -> str:
     )
     return (
         '(kicad_sch (version 20211123) (generator circuit_synth)\n'
-        + _sheet(pins)
+        + _sheet(pins, decimal_angle=decimal_angle)
         + hls
         + ')\n'
     )
@@ -210,6 +248,132 @@ def test_right_pin_justify_right(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# fix_sheet_symbol_sizes — decimal-formatted incoming pin angles
+#
+# Found on the acquisition board 2026-07-08: kicad_sch_api's own formatter
+# always serializes angle with 4 decimal places ("0.0000"/"180.0000") when it
+# resaves a file (e.g. an unrelated incremental-sync edit elsewhere in the
+# project causes a full round-trip through kicad_sch_api's object model).
+# The position-rewrite regex here required a bare integer angle (`\d+`,
+# matching the plain "0"/"180" this module itself writes) and silently failed
+# to match decimal angles -- so once a pin's incoming angle was already
+# decimal, its left_idx/right_idx slot counter never advanced and its
+# coordinates were never rewritten, permanently freezing it at a stale
+# position. Repeated regenerations (pin count shifting as, e.g., bus
+# collapsing removed members) then caused two *different* pins to land on the
+# exact same coordinate -- a real short/connectivity-collision on the sheet
+# symbol, not just a cosmetic issue.
+# ---------------------------------------------------------------------------
+
+def test_decimal_angle_pins_are_still_repositioned(tmp_path: Path) -> None:
+    """A pin arriving with an already-decimal-formatted angle ("0.0000") must
+    still be repositioned onto the new grid -- not silently skipped."""
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(_top(["CLK", "DATA"], decimal_angle=True))   # CLK -> left
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    assert "(at 10.0000 12.5400 180)" in text, (
+        f"decimal-angle pin CLK was not repositioned to the left slot:\n{text}"
+    )
+    assert "(at 30.0000 12.5400 0)" in text, (
+        f"decimal-angle pin DATA was not repositioned to the right slot:\n{text}"
+    )
+
+
+def test_decimal_angle_pins_no_position_collision(tmp_path: Path) -> None:
+    """With N pins all arriving in decimal-angle format (the real-world state
+    after any kicad_sch_api resave), every pin must land on a distinct
+    coordinate -- no two sheet pins may collide."""
+    names = [f"SIG{i}" for i in range(10)]
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(_top(names, decimal_angle=True))
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    coords = re.findall(r'\(pin "[^"]+" input\n\t\t\t\(at ([\d.\-]+) ([\d.\-]+) [\d.\-]+\)', text)
+    assert len(coords) == len(names), f"expected {len(names)} pin coordinates, found {coords}"
+    assert len(set(coords)) == len(coords), (
+        f"pin position collision: {[c for c in coords if coords.count(c) > 1]}"
+    )
+
+
+def test_preexisting_collision_from_stale_decimal_positions_is_repaired(tmp_path: Path) -> None:
+    """Directly reproduces the acquisition-board MCU-sheet precondition: two
+    pins (e.g. GND and a bus-vector pin like SDMMC_[0..10]) already sitting at
+    the identical (x, y) -- stale positions frozen by an earlier run of this
+    same pass under a *different* pin count/n_left boundary (e.g. before bus
+    member collapsing shrank the list), each still carrying the decimal angle
+    kicad_sch_api's resave leaves behind. A correct run must resolve the
+    collision by repositioning every pin fresh, regardless of its incoming
+    angle format -- not leave two pins short-circuited onto the same point."""
+    sheetfile_y = _SY + _OLD_H + 0.7116
+    body = (
+        '\t(sheet\n'
+        f'\t\t(at {_SX:.4f} {_SY:.4f})\n'
+        f'\t\t(size {_W:.4f} {_OLD_H:.4f})\n'
+        '\t\t(property "Sheetfile" "sub.kicad_sch"\n'
+        f'\t\t\t(at {_SX:.4f} {sheetfile_y:.4f} 0)\n'
+        '\t\t)\n'
+    )
+    names = ["ALPHA", "BETA", "GND", "SDMMC_BUS", "ZETA", "OMEGA"]
+    collided_y = _SY + 2.54 + 2 * 2.54  # both GND and SDMMC_BUS start here
+    for k, name in enumerate(names):
+        if name in ("GND", "SDMMC_BUS"):
+            body += _pin_block_decimal_angle(name, _OLD_RIGHT_X, collided_y, angle=0.0)
+        else:
+            py = _SY + 2.54 + k * 2.54
+            body += _pin_block_decimal_angle(name, _OLD_RIGHT_X, py, angle=0.0)
+    body += '\t)\n'
+    content = '(kicad_sch (version 20211123) (generator circuit_synth)\n' + body + ')\n'
+    sch = tmp_path / "top.kicad_sch"
+    # Sanity: the fixture really does start with a collision.
+    precheck = re.findall(r'\(at [\d.]+ ([\d.]+) [\d.]+\)', content)
+    assert precheck.count(f"{collided_y:.4f}") == 2, "fixture setup failed to seed a collision"
+
+    sch.write_text(content)
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    coords = re.findall(r'\(pin "[^"]+" input\n\t\t\t\(at ([\d.\-]+) ([\d.\-]+) [\d.\-]+\)', text)
+    assert len(coords) == len(names)
+    assert len(set(coords)) == len(coords), (
+        f"GND/SDMMC_BUS collision was not repaired -- pins still overlap: {coords}"
+    )
+
+
+def test_mixed_integer_and_decimal_angle_pins_no_collision(tmp_path: Path) -> None:
+    """Some pins already correctly repositioned (plain-integer angle, from an
+    earlier successful run within the same pass) alongside others still
+    carrying a decimal angle -- both groups must end up on distinct
+    coordinates after this pass, whichever side (left/right) they land on."""
+    sheetfile_y = _SY + _OLD_H + 0.7116
+    body = (
+        '\t(sheet\n'
+        f'\t\t(at {_SX:.4f} {_SY:.4f})\n'
+        f'\t\t(size {_W:.4f} {_OLD_H:.4f})\n'
+        '\t\t(property "Sheetfile" "sub.kicad_sch"\n'
+        f'\t\t\t(at {_SX:.4f} {sheetfile_y:.4f} 0)\n'
+        '\t\t)\n'
+    )
+    names = ["A", "B", "C", "D", "E", "F"]
+    for k, name in enumerate(names):
+        py = _SY + 2.54 + k * 2.54
+        if k % 2 == 0:
+            body += _pin_block(name, _OLD_RIGHT_X, py, angle=0)
+        else:
+            body += _pin_block_decimal_angle(name, _OLD_RIGHT_X, py, angle=0.0)
+    body += '\t)\n'
+    content = '(kicad_sch (version 20211123) (generator circuit_synth)\n' + body + ')\n'
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(content)
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    coords = re.findall(r'\(pin "[^"]+" input\n\t\t\t\(at ([\d.\-]+) ([\d.\-]+) [\d.\-]+\)', text)
+    assert len(coords) == len(names)
+    assert len(set(coords)) == len(coords), (
+        f"pin position collision between integer- and decimal-angle pins: {coords}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # fix_sheet_symbol_sizes — hierarchical_label → label conversion
 # ---------------------------------------------------------------------------
 
@@ -268,6 +432,108 @@ def test_unmatched_hl_still_converted(tmp_path: Path) -> None:
     text = sch.read_text()
     assert "(hierarchical_label" not in text
     assert '(label "ORPHAN"' in text
+
+
+# ---------------------------------------------------------------------------
+# fix_sheet_symbol_sizes — root-sheet plain tie labels must track pin moves
+#
+# Found on the acquisition board 2026-07-08, as a second-order effect of
+# fixing the bus-connectivity bug: a true root sheet ties sibling sheet-symbol
+# pins together with plain `label`s (not hierarchical_label -- root has no
+# parent to forward to). When this pass moves a sheet pin to its freshly
+# recomputed grid slot, an un-tracked plain tie label is stranded at the pin's
+# OLD coordinate, where it can collide with whatever *different* pin the new
+# grid assigns to that spot.
+# ---------------------------------------------------------------------------
+
+def test_plain_tie_label_follows_repositioned_pin(tmp_path: Path) -> None:
+    """A root-level plain `label` coincident with a sheet pin's OLD position
+    must move to the pin's NEW position, the same way a hierarchical_label
+    does (test_hl_position_moved_to_left_pin)."""
+    content = (
+        '(kicad_sch (version 20211123) (generator circuit_synth)\n'
+        + _sheet(["CLK", "DATA"])                                    # CLK -> left
+        + _plain_label("CLK", _OLD_RIGHT_X, _SY + 2.54, angle=0.0)    # old CLK position
+        + ')\n'
+    )
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(content)
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    assert '(label "CLK"\n\t\t(at 10.0000 12.5400 180.0000)' in text, (
+        f"plain tie label CLK was not repositioned to follow its pin:\n{text}"
+    )
+
+
+def test_plain_tie_label_no_collision_with_repositioned_pin(tmp_path: Path) -> None:
+    """Directly reproduces the acquisition-board MCU-sheet precondition: a
+    root-level plain tie label (e.g. a bus-vector name like SDMMC_[0..10])
+    sitting at a bus pin's OLD position, and a DIFFERENT scalar pin (e.g. GND)
+    that the freshly recomputed grid assigns to that exact spot. The label
+    must move with its own pin, not collide with the unrelated one."""
+    names = ["ALPHA", "BUS_PIN", "GND", "ZETA"]
+    content = (
+        '(kicad_sch (version 20211123) (generator circuit_synth)\n'
+        + _sheet(names)
+        # BUS_PIN's tie label at its own (pre-reposition) coordinate --
+        # index 1 -> old y = _SY + 2.54 + 1*2.54
+        + _plain_label("BUS_PIN", _OLD_RIGHT_X, _SY + 2.54 + 2.54, angle=0.0)
+        + ')\n'
+    )
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(content)
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    pin_coords = re.findall(r'\(pin "([^"]+)" input\n\t\t\t\(at ([\d.\-]+) ([\d.\-]+) [\d.\-]+\)', text)
+    label_m = re.search(r'\(label "BUS_PIN"\n\t\t\(at ([\d.\-]+) ([\d.\-]+)', text)
+    assert label_m, f"BUS_PIN tie label missing after reposition:\n{text}"
+    label_xy = (label_m.group(1), label_m.group(2))
+    bus_pin_xy = next((x, y) for name, x, y in pin_coords if name == "BUS_PIN")
+    assert label_xy == bus_pin_xy, (
+        f"BUS_PIN's tie label {label_xy} did not follow its pin {bus_pin_xy}"
+    )
+    other_pin_coords = {(x, y) for name, x, y in pin_coords if name != "BUS_PIN"}
+    assert label_xy not in other_pin_coords, (
+        f"BUS_PIN's tie label collided with another pin at {label_xy}"
+    )
+
+
+def test_plain_tie_label_previously_on_left_edge_still_tracked(tmp_path: Path) -> None:
+    """Directly reproduces the acquisition-board ETH_TX_EN precondition (found
+    2026-07-08): a tie label frozen at the sheet's LEFT edge (sx) from some
+    earlier regeneration -- when the pin/member split shifted (e.g. the
+    alphabetical left/right boundary moved as other pins were added/removed),
+    the SAME pin is now classified on the RIGHT side this run. The old
+    label_updates lookup only ever registered a stale label's position as the
+    sheet's OLD RIGHT edge (old_right_x) -- a label already sitting at the
+    LEFT edge could never be found, leaving it permanently stranded and the
+    net effectively disconnected on the root sheet (no coincident tie at the
+    pin's real, current position)."""
+    names = ["ALPHA", "BETA", "GAMMA", "DELTA"]   # n=4, n_left=2: ALPHA/BETA left, GAMMA/DELTA right
+    content = (
+        '(kicad_sch (version 20211123) (generator circuit_synth)\n'
+        + _sheet(names)
+        # DELTA's tie label frozen at the sheet's LEFT edge (angle=180) --
+        # as if DELTA used to be a left-side pin in an earlier regeneration.
+        + _plain_label("DELTA", _SX, _SY + 2.54, angle=180.0)
+        + ')\n'
+    )
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(content)
+    fix_sheet_symbol_sizes(str(sch))
+    text = sch.read_text()
+    pin_coords = re.findall(r'\(pin "([^"]+)" input\n\t\t\t\(at ([\d.\-]+) ([\d.\-]+) [\d.\-]+\)', text)
+    delta_pin_xy = next((x, y) for name, x, y in pin_coords if name == "DELTA")
+    assert delta_pin_xy == ("30.0000", "15.0800"), f"unexpected DELTA pin position: {delta_pin_xy}"
+
+    label_m = re.search(r'\(label "DELTA"\n\t\t\(at ([\d.\-]+) ([\d.\-]+)', text)
+    assert label_m, f"DELTA tie label missing after reposition:\n{text}"
+    label_xy = (label_m.group(1), label_m.group(2))
+    assert label_xy == delta_pin_xy, (
+        f"DELTA's tie label {label_xy} is still stranded at the old LEFT edge, "
+        f"not tracking its pin's current position {delta_pin_xy} -- the net is "
+        f"effectively disconnected on the root sheet"
+    )
 
 
 # ---------------------------------------------------------------------------

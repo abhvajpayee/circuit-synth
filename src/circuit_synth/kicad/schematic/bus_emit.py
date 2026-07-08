@@ -62,7 +62,12 @@ def _bus_block(bus_label, taps, bus_x, top_y, pitch=2.54, stub=20.32, bus_hier=F
     """Draw one bus: a vertical bus wire + bus label (hierarchical when the bus
     crosses sheets), and per tap a bus_entry + stub wire carrying its label(s)."""
     y1 = top_y + (len(taps) - 1) * pitch + 5.08
-    head = _hier_label(bus_label, bus_x, top_y - 5.08) if bus_hier else _label(bus_label, bus_x, top_y - 5.08)
+    # The naming label must sit exactly on the bus wire's own start point (bus_x,
+    # top_y - 2.54) -- anywhere else it's a disconnected floating label, and the
+    # bus it was meant to name resolves as anonymous ("<NO NET>") everywhere it
+    # crosses sheets, which cascades into every member failing ERC's
+    # net_not_bus_member/bus_to_net_conflict checks.
+    head = _hier_label(bus_label, bus_x, top_y - 2.54) if bus_hier else _label(bus_label, bus_x, top_y - 2.54)
     s = [
         f'\t(bus\n\t\t(pts (xy {bus_x} {top_y - 2.54}) (xy {bus_x} {y1}))\n\t\t{_STROKE}\n\t\t(uuid "{_u()}")\n\t)',
         head,
@@ -107,7 +112,20 @@ def _retext_pin_labels(txt, positional, elaborated):
 
 def _parent_surgery(txt, members, bus_label):
     """On the parent sheet, collapse the per-member sheet pins on each child
-    symbol into one bus pin, and the per-member tie labels into one bus label."""
+    symbol into one bus pin, and the per-member tie labels into one bus label.
+
+    A parent ties its children's sheet pins together one of two ways, depending
+    on whether it is itself a child further up the hierarchy:
+    * a mid-level parent uses ``hierarchical_label``s (it forwards the net to
+      *its* parent);
+    * a true root sheet (no parent of its own) uses plain coincident-point
+      ``label``s instead -- circuit-synth's normal same-sheet tie mechanism.
+
+    Both must be collapsed the same way (rename the first member's tie to the
+    bus name, drop the rest -- their sheet pins are gone once collapsed, so an
+    un-collapsed tie label would otherwise dangle, and the survivor would carry
+    a scalar name that doesn't match the collapsed bus-vector pin, failing
+    ERC's bus-membership check)."""
     first, rest = members[0], members[1:]
 
     def fix_block(m):
@@ -118,10 +136,11 @@ def _parent_surgery(txt, members, bus_label):
         return b
 
     txt = re.sub(r'\t\(sheet\n.*?\n\t\)\n', fix_block, txt, flags=re.S)
-    txt = re.sub(r'\(hierarchical_label "' + re.escape(first) + r'"',
-                 f'(hierarchical_label "{bus_label}"', txt)
-    for mem in rest:
-        txt = re.sub(r'\t\(hierarchical_label "' + re.escape(mem) + r'"\n(?:\t\t[^\n]*\n)*\t\)\n', '', txt)
+    for label_kind in ("hierarchical_label", "label"):
+        txt = re.sub(r'\(' + label_kind + r' "' + re.escape(first) + r'"',
+                     f'({label_kind} "{bus_label}"', txt)
+        for mem in rest:
+            txt = re.sub(r'\t\(' + label_kind + r' "' + re.escape(mem) + r'"\n(?:\t\t[^\n]*\n)*\t\)\n', '', txt)
     return txt
 
 
@@ -153,12 +172,27 @@ def inject_buses(project_dir, buses):
             continue
         aliased = getattr(bus, "kind", "vector") == "aliased"
         alias = bus.alias_names if aliased else None
-        hierarchical = any(_is_hier(orig[n], m) for n in orig for m in members)
+        # A hierarchical bus is detected either by a member still carrying its
+        # promoted hierarchical_label (true only on the very first injection --
+        # this same pass demotes members to plain labels once drawn, via
+        # _demote()) or by the bus's OWN vector name already being a
+        # hierarchical_label somewhere (true on every run after the first).
+        # Checking members alone makes this whole function non-idempotent: on
+        # a second generate/incremental-sync, every member is already demoted,
+        # hierarchical comes back False, and the parent sheet -- which still
+        # carries the old per-member tie labels/pins from the first run --
+        # gets misclassified as an ordinary flat leaf sheet, drawing a bogus
+        # duplicate bus block on it and retexting its tie labels to the
+        # aliases instead of collapsing them (issue found 2026-07-08).
+        hierarchical = (any(_is_hier(orig[n], m) for n in orig for m in members)
+                        or any(_is_hier(orig[n], bus.label) for n in orig))
 
         # Leaf sheets carry the member component pins; the parent only ties them.
         candidates = [n for n in sheets if n not in parents] if hierarchical else sorted(sheets)
         draw_on = []
         for n in candidates:
+            if _present(orig[n], bus.label):
+                continue  # already injected on a previous run -- idempotent no-op
             present = [i for i, m in enumerate(members) if _present(orig[n], m)]
             if len(present) >= 2:
                 draw_on.append((n, present))
