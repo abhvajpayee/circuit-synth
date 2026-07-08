@@ -112,31 +112,51 @@ class HierarchicalSynchronizer:
                 logger.debug(f"Processing hierarchical sheets")
                 for sheet_elem in sheets_list:
                     logger.debug(f"Processing sheet element: {sheet_elem}")
-                    logger.debug(f"Sheet attributes: {dir(sheet_elem)}")
 
                     # Try different ways to get sheet info
                     sheet_file = None
                     sheet_name = None
 
-                    # Direct attributes
-                    if hasattr(sheet_elem, "filename"):
-                        sheet_file = sheet_elem.filename
-                    elif hasattr(sheet_elem, "file"):
-                        sheet_file = sheet_elem.file
-                    if hasattr(sheet_elem, "name"):
-                        sheet_name = sheet_elem.name
+                    if isinstance(sheet_elem, dict):
+                        # kicad-sch-api >=0.5.x represents each hierarchical
+                        # sheet in Schematic._data["sheets"] as a plain dict
+                        # with "name"/"filename" keys directly -- there is no
+                        # "properties" list of Property objects on these
+                        # entries (see kicad_sch_api Schematic.load()).
+                        sheet_file = sheet_elem.get("filename")
+                        sheet_name = sheet_elem.get("name")
+                    else:
+                        # Older kicad-sch-api versions exposed sheet elements
+                        # as objects with attributes instead of dict keys.
+                        if hasattr(sheet_elem, "filename"):
+                            sheet_file = sheet_elem.filename
+                        elif hasattr(sheet_elem, "file"):
+                            sheet_file = sheet_elem.file
+                        if hasattr(sheet_elem, "name"):
+                            sheet_name = sheet_elem.name
 
-                    # From at property (position)
-                    if hasattr(sheet_elem, "at"):
-                        logger.debug(f"Sheet at: {sheet_elem.at}")
+                        # From at property (position)
+                        if hasattr(sheet_elem, "at"):
+                            logger.debug(f"Sheet at: {sheet_elem.at}")
 
-                    # From properties
-                    if hasattr(sheet_elem, "properties"):
-                        for prop in sheet_elem.properties:
-                            if prop.name == "Sheetfile":
-                                sheet_file = prop.value
-                            elif prop.name == "Sheetname":
-                                sheet_name = prop.value
+                        # From properties -- support both the legacy
+                        # list-of-Property-objects shape (.name/.value
+                        # attributes) and the dict shape used by
+                        # kicad-sch-api >=0.5.x (name -> value).
+                        if hasattr(sheet_elem, "properties"):
+                            props = sheet_elem.properties
+                            if isinstance(props, dict):
+                                if "Sheetfile" in props:
+                                    sheet_file = props["Sheetfile"]
+                                if "Sheetname" in props:
+                                    sheet_name = props["Sheetname"]
+                            else:
+                                for prop in props:
+                                    prop_name = getattr(prop, "name", None)
+                                    if prop_name == "Sheetfile":
+                                        sheet_file = prop.value
+                                    elif prop_name == "Sheetname":
+                                        sheet_name = prop.value
 
                     logger.debug(f"Sheet file: {sheet_file}, name: {sheet_name}")
 
@@ -162,6 +182,10 @@ class HierarchicalSynchronizer:
                 )
 
             # Alternative: Look in components for sheet instances
+            # (defensive fallback -- normal projects resolve all sheets via
+            # schematic._data["sheets"] above; this only matters if a sheet
+            # is represented as a regular component with a Sheetfile
+            # property instead)
             if len(sheet.children) == 0:
                 for comp in schematic.components:
                     # Check if this is a sheet (has Sheetfile property)
@@ -169,11 +193,22 @@ class HierarchicalSynchronizer:
                     sheet_name = None
 
                     if hasattr(comp, "properties"):
-                        for prop in comp.properties:
-                            if prop.name == "Sheetfile":
-                                sheet_file = prop.value
-                            elif prop.name == "Sheetname":
-                                sheet_name = prop.value
+                        props = comp.properties
+                        if isinstance(props, dict):
+                            # kicad-sch-api >=0.5.x: Component.properties is
+                            # a name -> value dict, not a list of Property
+                            # objects with .name/.value attributes.
+                            if "Sheetfile" in props:
+                                sheet_file = props["Sheetfile"]
+                            if "Sheetname" in props:
+                                sheet_name = props["Sheetname"]
+                        else:
+                            for prop in props:
+                                prop_name = getattr(prop, "name", None)
+                                if prop_name == "Sheetfile":
+                                    sheet_file = prop.value
+                                elif prop_name == "Sheetname":
+                                    sheet_name = prop.value
 
                     if sheet_file:
                         logger.debug(

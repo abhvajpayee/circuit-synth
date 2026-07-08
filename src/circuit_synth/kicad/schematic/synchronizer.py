@@ -37,6 +37,65 @@ POWER_SYMBOL_PREFIX = "#PWR"
 PIN_LABEL_DISTANCE_TOLERANCE = 0.5  # mm - distance threshold for associating labels/symbols with pins
 
 
+def _patch_kicad_sch_api_reference_validation() -> None:
+    """
+    Compatibility shim for kicad-sch-api's overly strict legacy reference
+    validator (kicad_sch_api.utils.validation.SchematicValidator).
+
+    Root cause: kicad-sch-api ships TWO independent reference-format
+    checkers that disagree with each other:
+      - kicad_sch_api.core.managers.validation.ValidationManager
+        ._validate_reference_format(): accepts any leading run of alpha
+        characters (any case) followed by a run of digits -- reports
+        mismatches as a non-blocking "warning".
+      - kicad_sch_api.utils.validation.SchematicValidator.validate_reference():
+        a stricter, case-sensitive regex (^(#[A-Z]+[0-9]+|[A-Z]+[0-9]*[A-Z]?
+        |[A-Z]+\\?)$) with no allowance for lowercase letters or
+        underscores -- reports mismatches as a hard "error", and
+        Schematic.save() aborts (ValidationError) if any hard errors exist.
+
+    circuit-synth's own cap_bank()/resistor_bank() helpers intentionally
+    generate multi-segment, mixed-case reference designators for named bank
+    members (e.g. "Rpu0", "R_DBG_SCL_PU1", "C_BULK1") -- these are valid
+    KiCad reference strings and have always round-tripped fine through the
+    clean-regenerate (--force) path, which does not call Schematic.save()'s
+    validate-before-save gate. The incremental sync path (this module) does
+    call it, so as of kicad-sch-api 0.5.x this crashes with:
+        ValidationError: Cannot save schematic with validation errors
+
+    Until this is reconciled upstream in kicad-sch-api (the two validators
+    should agree; see https://github.com/circuit-synth/kicad-sch-api), relax
+    the legacy validator's pattern here to match what the newer
+    ValidationManager already treats as acceptable, plus underscores (which
+    ValidationManager still flags as a non-blocking warning but which are a
+    long-standing, working part of circuit-synth's bank-naming convention).
+    """
+    try:
+        from kicad_sch_api.utils.validation import SchematicValidator
+    except ImportError:
+        logger.debug("kicad_sch_api.utils.validation.SchematicValidator not found; skipping reference-validation compat shim")
+        return
+
+    import re
+
+    permissive_pattern = re.compile(r"^#?[A-Za-z][A-Za-z0-9_]*\??$")
+
+    def _permissive_validate_reference(self, reference: str) -> bool:
+        if not reference:
+            return False
+        return bool(permissive_pattern.match(reference))
+
+    if getattr(SchematicValidator.validate_reference, "_circuit_synth_patched", False):
+        return  # Already patched (e.g. module reloaded)
+
+    _permissive_validate_reference._circuit_synth_patched = True
+    SchematicValidator.validate_reference = _permissive_validate_reference
+    logger.debug("Patched kicad_sch_api SchematicValidator.validate_reference with permissive compat pattern")
+
+
+_patch_kicad_sch_api_reference_validation()
+
+
 class PowerSymbolLabel:
     """
     Pseudo-label representing a power symbol at a pin location.
