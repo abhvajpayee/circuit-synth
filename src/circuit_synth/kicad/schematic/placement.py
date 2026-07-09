@@ -727,19 +727,32 @@ class PlacementEngine:
                 )
             )
 
-        # Add sheet bounds if sheets exist
-        if hasattr(self.schematic, "sheets"):
-            for sheet in self.schematic.sheets:
-                # Sheets store their position as top-left corner
-                bounds.append(
-                    ElementBounds(
-                        sheet.position.x,
-                        sheet.position.y,
-                        sheet.size[0],
-                        sheet.size[1],
-                        "sheet",
-                    )
+        # Add sheet bounds if sheets exist. SheetManager has no __iter__/__len__ —
+        # it stores sheets as raw dicts internally and exposes them only via the
+        # public BaseManager.data property, not as iterable Sheet objects.
+        sheets_data = []
+        manager = getattr(self.schematic, "sheets", None)
+        manager_data = getattr(manager, "data", None) if manager is not None else None
+        if isinstance(manager_data, dict):
+            sheets_data = manager_data.get("sheets", []) or []
+
+        for sheet in sheets_data:
+            # Sheets store their position as top-left corner
+            position = sheet.get("position") or {}
+            size = sheet.get("size") or {}
+            width = size.get("width", 0)
+            height = size.get("height", 0)
+            if not width or not height:
+                continue
+            bounds.append(
+                ElementBounds(
+                    position.get("x", 0),
+                    position.get("y", 0),
+                    width,
+                    height,
+                    "sheet",
                 )
+            )
 
         return bounds
 
