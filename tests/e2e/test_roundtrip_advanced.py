@@ -278,7 +278,9 @@ class TestComponentLifecycle:
             assert sch.components.get("R1") is not None
             assert sch.components.get("R2") is not None
 
-            # Step 2: Remove R2
+            # Step 2: Remove R2 (preserve_user_components=False so the removal
+            # actually takes effect — the default is True, which would keep R2
+            # around and make this test pass regardless of whether removal works)
             @circuit(name="test_remove")
             def circuit_v2():
                 r1 = Component("Device:R", ref="R1", value="10k")
@@ -290,15 +292,18 @@ class TestComponentLifecycle:
 
             c2 = circuit_v2()
             c2.generate_kicad_project(
-                str(output_path), force_regenerate=False, generate_pcb=False
+                str(output_path),
+                force_regenerate=False,
+                generate_pcb=False,
+                preserve_user_components=False,
             )
 
-            # Step 3: Verify R2 was removed (if preserve_user_components=False)
-            # Note: By default preserve_user_components=True, so R2 will be preserved
-            # This test documents current behavior
+            # Step 3: Verify R2 was actually removed and R1 was preserved
             sch_after = ksa.Schematic.load(str(sch_path))
             assert sch_after.components.get("R1") is not None, "R1 should still exist"
-            # R2 may be preserved depending on synchronizer settings
+            assert sch_after.components.get("R2") is None, (
+                "R2 should have been removed (preserve_user_components=False)"
+            )
 
     def _find_schematic(self, output_path, tmpdir):
         """Helper to find schematic file."""
