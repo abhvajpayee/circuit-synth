@@ -13,6 +13,37 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def build_ref_to_pin_net_map(circuit: Any) -> Dict[str, Dict[str, str]]:
+    """
+    Build a {component_ref: {pin_number: net_name}} map from a circuit's own
+    net connections, for callers that need to pass a real `pin_net_map` into
+    `SymbolBoundingBoxCalculator.calculate_bounding_box()` / `get_symbol_dimensions()`
+    so pin labels are sized by their actual net name length rather than
+    falling into the generic "XXX" 3-character placeholder.
+
+    Mirrors the same `net.connections` iteration `_add_pin_level_net_labels`
+    (schematic_writer.py) already uses successfully -- `circuit.nets` may be
+    a dict (name -> Net) or a list of Net objects, each with `.name` and
+    `.connections` (a list of (component_ref, pin_number) tuples).
+
+    Args:
+        circuit: A circuit-like object exposing `.nets`.
+
+    Returns:
+        Dict keyed by component reference, each value a dict of
+        {pin_number: net_name}. Missing components simply aren't present as
+        keys -- callers should use `.get(ref, {})`.
+    """
+    circuit_nets = circuit.nets.values() if isinstance(circuit.nets, dict) else circuit.nets
+
+    ref_to_pin_net_map: Dict[str, Dict[str, str]] = {}
+    for net in circuit_nets:
+        for comp_ref, pin_identifier in net.connections:
+            ref_to_pin_net_map.setdefault(comp_ref, {})[pin_identifier] = net.name
+
+    return ref_to_pin_net_map
+
+
 class SymbolBoundingBoxCalculator:
     """Calculate the actual bounding box of a symbol from its graphical elements."""
 
@@ -351,38 +382,56 @@ class SymbolBoundingBoxCalculator:
             # Apply KiCad's standard pin name offset (0.508mm / 20 mils)
             offset = cls.DEFAULT_PIN_NAME_OFFSET
 
-            if angle == 0:  # Pin points right - label extends LEFT from endpoint
-                label_x = end_x - offset - name_width
-                print(
-                    f"    Angle 0 (Right pin): min_x {min_x:.2f} -> {label_x:.2f} (offset={offset:.3f})",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                min_x = min(min_x, label_x)
-            elif angle == 180:  # Pin points left - label extends RIGHT from endpoint
+            # Direction convention -- CORRECTED 2026-07-22 after an earlier
+            # same-day fix here turned out to be wrong (see
+            # tests/unit/kicad/test_pin_label_bounds_direction.py history).
+            #
+            # `angle` here is the pin's RAW angle as declared in the symbol
+            # (the direction the pin's own line points, into empty space,
+            # away from the body). That is NOT the angle the rendered label
+            # ends up at: `_add_pin_level_net_labels` (schematic_writer.py)
+            # computes `label_angle = (pin_angle + 180) % 360` before writing
+            # the label, and KiCad's justify convention then determines which
+            # way the TEXT extends from that. Verified directly against a
+            # real generated schematic: the SDRAM's DQ15 pin is declared at
+            # raw angle 0, but its rendered net label has angle 180 and
+            # visibly extends toward -X. Skipping the +180 step and reasoning
+            # from the raw angle directly (as an earlier version of this
+            # function did) gets every cardinal direction backwards.
+            render_angle = (angle + 180) % 360
+
+            if render_angle == 0:  # label extends toward +X
                 label_x = end_x + offset + name_width
                 print(
-                    f"    Angle 180 (Left pin): max_x {max_x:.2f} -> {label_x:.2f} (offset={offset:.3f})",
+                    f"    angle={angle} (render 0): max_x {max_x:.2f} -> {label_x:.2f} (offset={offset:.3f})",
                     file=sys.stderr,
                     flush=True,
                 )
                 max_x = max(max_x, label_x)
-            elif angle == 90:  # Pin points up - label extends DOWN from endpoint
-                label_y = end_y - offset - name_height
+            elif render_angle == 180:  # label extends toward -X
+                label_x = end_x - offset - name_width
                 print(
-                    f"    Angle 90 (Up pin): min_y {min_y:.2f} -> {label_y:.2f} (offset={offset:.3f})",
+                    f"    angle={angle} (render 180): min_x {min_x:.2f} -> {label_x:.2f} (offset={offset:.3f})",
                     file=sys.stderr,
                     flush=True,
                 )
-                min_y = min(min_y, label_y)
-            elif angle == 270:  # Pin points down - label extends UP from endpoint
+                min_x = min(min_x, label_x)
+            elif render_angle == 90:  # label extends toward +Y
                 label_y = end_y + offset + name_height
                 print(
-                    f"    Angle 270 (Down pin): max_y {max_y:.2f} -> {label_y:.2f} (offset={offset:.3f})",
+                    f"    angle={angle} (render 90): max_y {max_y:.2f} -> {label_y:.2f} (offset={offset:.3f})",
                     file=sys.stderr,
                     flush=True,
                 )
                 max_y = max(max_y, label_y)
+            elif render_angle == 270:  # label extends toward -Y
+                label_y = end_y - offset - name_height
+                print(
+                    f"    angle={angle} (render 270): min_y {min_y:.2f} -> {label_y:.2f} (offset={offset:.3f})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                min_y = min(min_y, label_y)
 
         # Pin numbers are typically placed near the component body
         if pin_number:
