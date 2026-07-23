@@ -88,6 +88,15 @@ class SimplifiedPinAccess:
     def __setitem__(self, pin_id: Union[int, str], new_pin: Pin):
         """
         Set a pin. Ignores PinGroup assignments (from += operations).
+
+        Note: `comp["NAME"] += net` triggers Python's augmented-assignment
+        protocol -- __getitem__ (fetch), Pin.__iadd__ (connect), then this
+        __setitem__ as a writeback of the (same) result -- even when `pin_id`
+        was a NAME string rather than the pin's own number. Always re-key by
+        the pin's own number so a name-based writeback can't create a second,
+        bogus dict entry under the name string; and de-duplicate the
+        `_pin_names` list so repeated writebacks for the same physical pin
+        don't grow it past one entry.
         """
         # Ignore PinGroup assignments (these happen after += operations)
         if isinstance(new_pin, PinGroup):
@@ -98,15 +107,16 @@ class SimplifiedPinAccess:
                 f"Can only assign Pin objects, got {type(new_pin).__name__}"
             )
 
-        # Convert integer to string
-        if isinstance(pin_id, int):
-            pin_id = str(pin_id)
+        # Always store by the pin's OWN number -- `pin_id` may be the NAME
+        # the caller indexed with (e.g. comp["PG7"] += net), not the pin's
+        # number, and keying by it would create a second entry for one pin.
+        pin_key = str(new_pin.num)
+        self._pins[pin_key] = new_pin
 
-        # Store by pin number
-        self._pins[pin_id] = new_pin
-
-        # Update name lookup if applicable
+        # Update name lookup if applicable, de-duplicated by identity so a
+        # writeback for a pin already registered under this name doesn't
+        # grow the list.
         if hasattr(self, "_pin_names") and new_pin.name and new_pin.name != "~":
-            if new_pin.name not in self._pin_names:
-                self._pin_names[new_pin.name] = []
-            self._pin_names[new_pin.name].append(new_pin)
+            existing = self._pin_names.setdefault(new_pin.name, [])
+            if new_pin not in existing:
+                existing.append(new_pin)

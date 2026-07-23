@@ -237,7 +237,18 @@ class NetlistExporter:
         #    (including any net that actually comes from a parent)
         net_to_pins = {}
         for comp in self.circuit._components.values():
+            # `comp._pins` is keyed by pin identifier, but the same physical
+            # Pin object can legitimately be reachable under more than one
+            # key (e.g. historically, a name-indexed writeback could key it
+            # by both its number and its name -- see simple_pin_access.py).
+            # De-duplicate by object identity so one physical pin never
+            # produces more than one connection node here.
+            seen_pin_ids = set()
             for pin_id, pin_obj in comp._pins.items():
+                if id(pin_obj) in seen_pin_ids:
+                    continue
+                seen_pin_ids.add(id(pin_obj))
+
                 net_obj = pin_obj.net
                 if net_obj is None:
                     continue
@@ -355,11 +366,19 @@ class NetlistExporter:
         used_nets: Dict[str, List[Dict[str, Any]]] = {}
 
         for comp in self.circuit._components.values():
+            # De-duplicate by object identity -- see the matching guard in
+            # to_dict() above for why the same Pin object can be reachable
+            # under more than one key in `comp._pins`.
+            seen_pin_ids = set()
+
             # IMPORTANT FIX: iterate over pin objects, not pin IDs
             # if comp._pins is dict-like {pin_id: Pin(...), ...}
             if hasattr(comp._pins, "values"):
                 # assume it's a dict: pin_id -> Pin
                 for pin_obj in comp._pins.values():
+                    if id(pin_obj) in seen_pin_ids:
+                        continue
+                    seen_pin_ids.add(id(pin_obj))
                     net_obj = pin_obj.net
                     if net_obj is not None:
                         net_name = net_obj.name
