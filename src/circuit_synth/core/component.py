@@ -458,6 +458,8 @@ class Component(SimplifiedPinAccess):
                     "y": pin_obj.y,
                     "length": pin_obj.length,
                     "orientation": pin_obj.orientation,
+                    "no_connect": pin_obj.is_no_connect,
+                    "no_connect_reason": pin_obj.no_connect_reason,
                 }
             )
         return data
@@ -522,6 +524,8 @@ class Component(SimplifiedPinAccess):
             )
             pin_obj._component = comp
             pin_obj._component_pin_id = int(pin_num) if pin_num.isdigit() else 0
+            pin_obj._no_connect = bool(pinfo.get("no_connect", False))
+            pin_obj._no_connect_reason = pinfo.get("no_connect_reason")
 
             # Store by pin number
             comp._pins[pin_num] = pin_obj

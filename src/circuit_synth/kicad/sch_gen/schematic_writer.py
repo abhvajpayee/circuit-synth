@@ -465,6 +465,11 @@ class SchematicWriter:
         labels_time = time.perf_counter() - labels_start
         logger.info(f"✅ STEP 3/8: Net labels added in {labels_time*1000:.2f}ms")
 
+        # Emit real KiCad no-connect markers for every Pin.no_connect()-marked
+        # pin (see core/pin.py). Runs after net labels so _pin_xy has the
+        # same, already-placed component positions/rotations to work from.
+        self._add_no_connect_markers()
+
         # Cap banks: draw the two shared rails + one net marker per rail.
         self._draw_cap_bank_rails()
         # Resistor banks: draw the single shared rail + one common-net marker;
@@ -880,9 +885,20 @@ class SchematicWriter:
         try:
             from ..kicad_symbol_cache import SymbolLibCache
             from ..schematic.text_flow_placement import place_with_text_flow
-            from .symbol_geometry import SymbolBoundingBoxCalculator
+            from .symbol_geometry import (
+                SymbolBoundingBoxCalculator,
+                build_ref_to_pin_net_map,
+            )
 
             placement_start = time.perf_counter()
+
+            # Real net names per (component, pin), so labels are sized by
+            # their actual text length instead of falling into
+            # calculate_bounding_box()'s generic "XXX" fallback (see
+            # build_ref_to_pin_net_map's docstring -- this was previously
+            # omitted here entirely, which let components with long net
+            # names get placed with no real label clearance).
+            ref_to_pin_net_map = build_ref_to_pin_net_map(self.circuit)
 
             # Get accurate bounding boxes using SymbolBoundingBoxCalculator
             # (same method used to draw the bbox rectangles)
@@ -916,7 +932,9 @@ class SchematicWriter:
                     )
                     min_x, min_y, max_x, max_y = (
                         SymbolBoundingBoxCalculator.calculate_bounding_box(
-                            lib_data, include_properties=True
+                            lib_data,
+                            include_properties=True,
+                            pin_net_map=ref_to_pin_net_map.get(comp.reference, {}),
                         )
                     )
                     width = max_x - min_x
@@ -1722,6 +1740,86 @@ class SchematicWriter:
             )
         except Exception as e:
             logger.warning(f"cap_bank: could not rotate field text for {sym}: {e}")
+
+    def _add_no_connect_markers(self):
+        """Emit a real KiCad (no_connect (at x y)) element for every pin
+        marked Pin.no_connect() in the Python source (core/pin.py).
+
+        Source of truth: `self.circuit.no_connect_pins`, a list of
+        (component_ref, pin_identifier, reason) tuples built by
+        circuit_loader._parse_circuit from Component.to_dict()'s per-pin
+        "no_connect"/"no_connect_reason" fields.
+
+        Position uses `_pin_xy` -- the exact same rotation/mirror-aware
+        pin-tip math `_add_pin_level_net_labels` uses for label placement
+        -- so a no-connect marker lands precisely at the pin tip with no
+        re-derivation of that geometry. `reason` is not written into the
+        KiCad file (there's no field for it on a no_connect element); it
+        stays in the Python source as the readable record, same as any
+        other comment.
+
+        Missing components/pins are logged and skipped, not raised --
+        `no_connect()`'s own conflict guards (core/pin.py) are the
+        authoritative validation; this pass only has to place markers for
+        entries that already passed that check.
+        """
+        no_connect_pins = getattr(self.circuit, "no_connect_pins", None) or []
+        if not no_connect_pins:
+            return
+
+        added = 0
+        for actual_ref, pin_identifier, reason in no_connect_pins:
+            comp = self.component_manager.find_component(actual_ref)
+            if not comp:
+                logger.warning(
+                    f"no_connect: component {actual_ref} not found; "
+                    f"skipping pin {pin_identifier}"
+                )
+                continue
+
+            xy = self._pin_xy(comp, pin_identifier)
+            if xy is None:
+                logger.warning(
+                    f"no_connect: pin {pin_identifier} not found on "
+                    f"{actual_ref} ({comp.lib_id}); skipping marker"
+                )
+                continue
+
+            x, y = xy
+
+            # write_schematic_file() serializes straight from
+            # `schematic._data` (via kicad-sch-api's own parser/formatter),
+            # NOT from the high-level `.no_connects` collection -- only
+            # `.components` gets bridged back via `_sync_components_to_data()`
+            # before writing. Write directly into `_data["no_connects"]`
+            # (the same {"position": {"x","y"}, "uuid": ...} shape
+            # kicad-sch-api's own parser/formatter round-trips) to match how
+            # `_add_pin_level_net_labels` above already bypasses the
+            # collection API for the same reason. Fall back to the
+            # `.no_connects` collection API when `_data` isn't present
+            # (e.g. a minimal test double), matching that same dual-path
+            # pattern.
+            if not hasattr(self.schematic, "_data"):
+                self.schematic.no_connects.add(Point(x, y))
+            else:
+                self.schematic._data.setdefault("no_connects", []).append(
+                    {
+                        "position": {"x": x, "y": y},
+                        "uuid": str(uuid_module.uuid4()),
+                    }
+                )
+            added += 1
+            logger.debug(
+                f"Added no-connect marker for {actual_ref}.{pin_identifier} "
+                f"at ({x:.3f}, {y:.3f})"
+                + (f" -- {reason}" if reason else "")
+            )
+
+        if added:
+            logger.info(
+                f"Added {added} no-connect marker(s) for circuit "
+                f"'{self.circuit.name}'"
+            )
 
     def _pin_xy(self, comp, pin_identifier):
         """Absolute (x, y) of a component pin tip, matching the label placement math

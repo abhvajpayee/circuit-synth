@@ -4,6 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
 from ._logger import context_logger
+from .exception import ComponentError
 from .net import Net
 
 if TYPE_CHECKING:
@@ -111,6 +112,13 @@ class Pin:
         # The Net currently connected (None if unconnected)
         self.net: Optional[Net] = None
 
+        # Set by no_connect() when this pin is explicitly documented as
+        # intentionally unconnected (renders a KiCad no-connect marker at
+        # schematic-generation time). Mutually exclusive with self.net --
+        # see no_connect() and connect_to_net().
+        self._no_connect: bool = False
+        self._no_connect_reason: Optional[str] = None
+
         # Assigned by the parent Component
         self._component: "Component" = None
         self._component_pin_id: int = None
@@ -145,6 +153,61 @@ class Pin:
         """Return True if this pin is connected to a net."""
         return self.net is not None
 
+    @property
+    def is_no_connect(self) -> bool:
+        """Return True if this pin has been marked no_connect()."""
+        return self._no_connect
+
+    @property
+    def no_connect_reason(self) -> Optional[str]:
+        """The reason string passed to no_connect(), if any."""
+        return self._no_connect_reason
+
+    def no_connect(self, reason: Optional[str] = None) -> "Pin":
+        """
+        Mark this pin as intentionally left unconnected.
+
+        Generates a real KiCad no-connect marker ((no_connect (at x y)))
+        at this pin's exact, rotation/mirror-aware position when the
+        schematic is generated -- see
+        `SchematicWriter._add_no_connect_markers` (schematic_writer.py).
+        This suppresses kicad-cli ERC's `pin_not_connected` finding for
+        this pin without needing any downstream ERC-based post-processing.
+
+        Args:
+            reason: Optional human-readable note (e.g. a datasheet
+                citation) documenting WHY the pin is left unconnected.
+                Not written into the KiCad file -- it stays in the Python
+                source as the readable record, same as any other comment.
+
+        Returns:
+            Pin: Self, for chaining.
+
+        Raises:
+            ComponentError: If this pin is already connected to a net --
+                a pin cannot be both wired and marked no-connect. Mark the
+                pin no_connect() BEFORE ever doing `pin += net`, or not at
+                all.
+        """
+        if self.net is not None:
+            raise ComponentError(
+                f"Cannot mark pin '{self.name}' (#{self.num}) of "
+                f"{self._component.ref if self._component else '?'} as "
+                f"no_connect(): it is already connected to net "
+                f"'{self.net.name}'. A pin cannot be both wired and "
+                f"no-connect."
+            )
+        self._no_connect = True
+        self._no_connect_reason = reason
+        context_logger.debug(
+            "Pin marked no_connect",
+            component="PIN",
+            pin_name=self.name,
+            pin_number=self.num,
+            reason=reason,
+        )
+        return self
+
     def connect_to_net(self, net: Net):
         """
         If already on another net, remove from old net. Then join the new net.
@@ -154,7 +217,16 @@ class Pin:
 
         Raises:
             ValueError: If connecting would create an invalid pin type combination
+            ComponentError: If this pin was already marked no_connect()
         """
+        if self._no_connect:
+            raise ComponentError(
+                f"Cannot connect pin '{self.name}' (#{self.num}) of "
+                f"{self._component.ref if self._component else '?'} to net "
+                f"'{net.name}': it is already marked no_connect("
+                f"reason={self._no_connect_reason!r}). A pin cannot be both "
+                f"no-connect and wired."
+            )
         # Check pin type compatibility if there are other pins on the net
         if net._pins:
             other_pin = next(iter(net._pins))
@@ -256,6 +328,8 @@ class Pin:
             "net": self.net.name if self.net else None,
             "component": self._component.ref if self._component else None,
             "geometry": self._geometry,
+            "no_connect": self._no_connect,
+            "no_connect_reason": self._no_connect_reason,
         }
 
     def __json__(self) -> dict:

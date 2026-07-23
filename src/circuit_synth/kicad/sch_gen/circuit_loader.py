@@ -100,6 +100,13 @@ class Circuit:
         self.child_instances = []
         # Annotations for text elements
         self._annotations = []
+        # Pins marked Pin.no_connect() in the Python source, as
+        # (component_ref, pin_identifier, reason) tuples. Consumed by
+        # SchematicWriter._add_no_connect_markers() to emit a real KiCad
+        # (no_connect (at x y)) element per entry. `pin_identifier` uses the
+        # same number-over-name precedence as net connection parsing below,
+        # so it resolves against a symbol's library pin data the same way.
+        self.no_connect_pins: List[tuple] = []
 
     def add_component(self, comp: SchematicSymbol):
         logger.debug(
@@ -247,6 +254,34 @@ def _parse_circuit(circ_data: dict, sub_dict: Dict[str, Circuit]) -> Circuit:
                 ),  # Changed from 'orientation' to 'rotation'
             )
             comp.pins.append(pin_obj)
+
+            # Collect Pin.no_connect()-marked pins. Uses the same
+            # number-over-name identifier precedence, and the same
+            # empty/"~" fallthrough, as the net connection parsing below --
+            # see the comment there for why (multiple same-named pins, e.g.
+            # VDD, must stay distinguishable). `Component.to_dict()`
+            # (core/component.py) is the producer: it puts the pin's own
+            # number under "pin_id" (NOT "num" -- that key is a separate,
+            # pre-existing mismatch in the SchematicPin construction just
+            # above, out of scope here).
+            if p.get("no_connect"):
+                nc_pin_id = str(p.get("pin_id", ""))
+                nc_name = p.get("name", "")
+                if nc_pin_id and nc_pin_id != "~":
+                    nc_identifier = nc_pin_id
+                elif nc_name and nc_name != "~":
+                    nc_identifier = nc_name
+                else:
+                    nc_identifier = None
+                if nc_identifier is not None:
+                    circuit.no_connect_pins.append(
+                        (ref, nc_identifier, p.get("no_connect_reason"))
+                    )
+                else:
+                    logger.warning(
+                        f"no_connect pin on {ref} has no usable pin number "
+                        f"or name; skipping marker."
+                    )
 
         circuit.add_component(comp)
 
