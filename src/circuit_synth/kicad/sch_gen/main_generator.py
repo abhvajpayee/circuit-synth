@@ -818,6 +818,10 @@ class SchematicGenerator:
         sheet_uuids[top_name] = main_writer.uuid_top
         sheet_writers[top_name] = main_writer  # Store main writer for reference
 
+        # Store child sheet pins for intermediate sheet processing
+        # Maps child_name -> [(pin_name, position, pin_type), ...]
+        all_child_pins = {top_name: main_writer.child_sheet_pins}
+
         logger.debug(f"  Root schematic UUID: {main_writer.uuid_top}")
         logger.debug(f"  Sheet symbols in main circuit:")
         for name, sheet_uuid in main_writer.sheet_symbol_map.items():
@@ -907,6 +911,11 @@ class SchematicGenerator:
                         )
                         logger.debug(f"  Path length: {len(hierarchical_path)}")
 
+                        # Get parent's sheet pins for this child (for intermediate sheet labels)
+                        parent_pins_for_child = None
+                        if parent_name in all_child_pins:
+                            parent_pins_for_child = all_child_pins[parent_name].get(c_name, [])
+
                         writer = SchematicWriter(
                             circ,
                             sub_dict,
@@ -916,12 +925,16 @@ class SchematicGenerator:
                             hierarchical_path=hierarchical_path,
                             reference_manager=shared_ref_manager,
                             draw_bounding_boxes=draw_bounding_boxes,
+                            parent_pins=parent_pins_for_child,
                         )
                         sch_expr = writer.generate_s_expr()
                         sheet_uuids[c_name] = writer.uuid_top
                         sheet_writers[c_name] = (
                             writer  # Store writer for nested subcircuits
                         )
+
+                        # Store this circuit's child pins for its own children (for intermediate sheet labels)
+                        all_child_pins[c_name] = writer.child_sheet_pins
 
                         # Store this circuit's info for its children
                         circuit_parent_info[c_name] = {

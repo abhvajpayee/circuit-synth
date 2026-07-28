@@ -294,6 +294,7 @@ class SchematicWriter:
         reference_manager: IntegratedReferenceManager = None,
         draw_bounding_boxes: bool = False,
         uuid: str = None,
+        parent_pins: list = None,
     ):
         """
         :param circuit: The Circuit object (subcircuit or top-level) to be written.
@@ -304,9 +305,11 @@ class SchematicWriter:
         :param hierarchical_path: List of UUIDs representing the full path from root
         :param reference_manager: Optional shared reference manager for global uniqueness
         :param uuid: Optional UUID for the schematic (if not provided, generates a new one)
+        :param parent_pins: List of (pin_name, position, pin_type) tuples for this circuit's sheet pins in parent
         """
         self.circuit = circuit
         self.all_subcircuits = circuit_dict
+        self.parent_pins = parent_pins or []  # Pins from parent sheet symbol
         self.instance_naming_map = instance_naming_map
         self.uuid_top = uuid if uuid else str(uuid_module.uuid4())
         self.paper_size = paper_size
@@ -345,6 +348,10 @@ class SchematicWriter:
 
         # Initialize sheet symbol tracking for hierarchical references
         self.sheet_symbol_map = {}  # Maps subcircuit name to sheet symbol UUID
+
+        # Track sheet pins created for child circuits (for intermediate sheet label generation)
+        # Maps child_circuit_name -> [(pin_name, position, pin_type), ...]
+        self.child_sheet_pins = {}
 
         # Log initialization details
         logger.debug(f"SchematicWriter initialized for circuit '{circuit.name}'")
@@ -488,6 +495,13 @@ class SchematicWriter:
         self._add_subcircuit_sheets()
         sheets_time = time.perf_counter() - sheets_start
         logger.info(f"✅ STEP 4/8: Subcircuit sheets added in {sheets_time*1000:.2f}ms")
+
+        # Add hierarchical labels for intermediate sheets (sheets with no components, only children)
+        intermediate_start = time.perf_counter()
+        self._add_intermediate_sheet_labels()
+        intermediate_time = time.perf_counter() - intermediate_start
+        if intermediate_time > 0.001:  # Only log if it took significant time
+            logger.info(f"✅ Intermediate sheet labels added in {intermediate_time*1000:.2f}ms")
 
         # Create ComponentUnits (bundles component + labels + bbox)
         units_start = time.perf_counter()
@@ -2317,6 +2331,9 @@ class SchematicWriter:
             pin_spacing = 2.54  # 100mil spacing
             start_y = sheet_y + 2.54
 
+            # Track pins for this child (for intermediate sheet label generation)
+            pins_for_child = []
+
             for i, net_name in enumerate(pin_list):
                 # Ensure pin positions are grid-aligned
                 pin_x = sheet_right  # Place pins on right edge of sheet
@@ -2332,6 +2349,10 @@ class SchematicWriter:
                 )
 
                 sheet.pins.append(sheet_pin)
+
+                # Track this pin for intermediate sheet processing
+                pins_for_child.append((net_name, Point(pin_x - 1.27, pin_y), sheet_pin.pin_type))
+
                 logger.debug(
                     f"Created sheet pin '{net_name}' at position ({pin_x}, {pin_y})"
                 )
@@ -2386,6 +2407,9 @@ class SchematicWriter:
                             "size": label.size,
                         }
                         self.schematic._data["labels"].append(label_dict)
+
+            # Store pins for this child circuit (for intermediate sheet processing)
+            self.child_sheet_pins[sub_name] = pins_for_child
 
             # Add sheet to schematic _data directly to bypass kicad-sch-api methods
             if not hasattr(self.schematic, "_data"):
@@ -2459,6 +2483,87 @@ class SchematicWriter:
             logger.debug(f"  Current hierarchical path: {self.hierarchical_path}")
             logger.debug(f"  Stored mapping: {sub_name} -> {sheet.uuid}")
             logger.debug(f"  Added sheet '{usage_label}' with {len(pin_list)} pins")
+
+    def _add_intermediate_sheet_labels(self):
+        """
+        Add hierarchical labels inside intermediate sheets.
+
+        An intermediate sheet has:
+        - No components (len(self.circuit.components) == 0)
+        - Child subcircuits (len(self.circuit.child_instances) > 0)
+
+        These sheets need hierarchical labels to connect parent sheet pins
+        to child sheet pins, allowing signals to flow through.
+
+        For each pin on this sheet's symbol in the parent:
+        1. Create hierarchical_label to receive signal from parent
+        2. Create plain label connecting to child sheet pins with same name
+        """
+        # Only process if this is an intermediate sheet
+        is_intermediate = (
+            len(self.circuit.components) == 0 and
+            len(self.circuit.child_instances) > 0
+        )
+
+        if not is_intermediate:
+            return
+
+        # Get pins from parent (if any)
+        if not self.parent_pins:
+            return
+
+        logger.debug(f"Adding {len(self.parent_pins)} hierarchical labels for intermediate sheet '{self.circuit.name}'")
+
+        # Import helper for label justification
+        from ..schematic.label_utils import calculate_hierarchical_label_justify
+
+        # For each pin from parent sheet symbol
+        for pin_name, pin_position, pin_type in self.parent_pins:
+            # Create hierarchical label at the pin position to receive signal from parent
+            # Use angle 180 (pointing left into the sheet) to match parent's outward-facing pin
+            angle = 180.0
+
+            hlabel_dict = {
+                "uuid": str(uuid_module.uuid4()),
+                "position": {"x": pin_position.x, "y": pin_position.y},
+                "text": pin_name,
+                "rotation": angle,
+                "size": 1.27,
+                "shape": "bidirectional",  # Default to bidirectional for intermediate sheets
+                "justify": calculate_hierarchical_label_justify(angle),
+            }
+
+            # Add to schematic's hierarchical_labels
+            if "hierarchical_labels" not in self.schematic._data:
+                self.schematic._data["hierarchical_labels"] = []
+            self.schematic._data["hierarchical_labels"].append(hlabel_dict)
+
+            logger.debug(f"  Created hierarchical_label '{pin_name}' at ({pin_position.x}, {pin_position.y})")
+
+            # Find which child sheet(s) have a pin with this name and create connecting labels
+            for child_info in self.circuit.child_instances:
+                sub_name = child_info["sub_name"]
+
+                # Check if this child has this pin
+                if sub_name in self.child_sheet_pins:
+                    child_pins = self.child_sheet_pins[sub_name]
+                    for child_pin_name, child_pin_pos, child_pin_type in child_pins:
+                        if child_pin_name == pin_name:
+                            # Create a plain label at the hierarchical_label position
+                            # connecting it to the child sheet pin
+                            label_dict = {
+                                "uuid": str(uuid_module.uuid4()),
+                                "position": {"x": pin_position.x, "y": pin_position.y},
+                                "text": pin_name,
+                                "rotation": angle,
+                                "size": 1.27,
+                            }
+
+                            if "labels" not in self.schematic._data:
+                                self.schematic._data["labels"] = []
+                            self.schematic._data["labels"].append(label_dict)
+
+                            logger.debug(f"    Created connecting label for child sheet '{sub_name}'")
 
     def _create_component_units(
         self, component_labels: Dict[str, List[Label]]
