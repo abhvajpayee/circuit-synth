@@ -834,12 +834,21 @@ class NetlistExporter:
                             e,
                         )
 
-        # Post-processing: fix sheet symbol sizes, pin placement, and label
-        # types.  Applied after both create and update paths so every generated
-        # schematic is KiCad 10 compatible regardless of how it was produced.
+        # Post-processing: fix sheet symbol sizes and pin placement. Applied
+        # after both create and update paths so every generated schematic is
+        # KiCad 10 compatible regardless of how it was produced. Runs on
+        # EVERY schematic file in the project directory, not just the
+        # top-level one -- each file's own (sheet ...) blocks describe its
+        # own children (e.g. a MCU sheet describing its own DRAM/TPM
+        # children), which need the identical resize/split treatment the
+        # root's own children get (see circuit.py's _postprocess_schematic
+        # for the full rationale; kept in sync with that call site).
         top_sch = kicad_sch_file
         if top_sch.exists():
             from ..kicad.sch_postprocess import fix_sheet_symbol_sizes, fix_subsheet_labels
-            fix_sheet_symbol_sizes(str(top_sch))
-            fix_subsheet_labels(str(top_sch))
-            logger.info("Schematic post-processing complete: %s", top_sch)
+            all_sch = sorted(top_sch.parent.glob("*.kicad_sch"))
+            for sch in all_sch:
+                fix_sheet_symbol_sizes(str(sch))
+            for sch in all_sch:
+                fix_subsheet_labels(str(sch))
+            logger.info("Schematic post-processing complete: %d sheet(s) under %s", len(all_sch), top_sch.parent)

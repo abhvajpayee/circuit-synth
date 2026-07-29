@@ -1329,7 +1329,18 @@ def _postprocess_schematic(
     output_path: Any, project_base_name: Any,
     context_logger: Any,  # actually a structlog/logger adapter
 ) -> None:
-    """Run fix_sheet_symbol_sizes and fix_subsheet_labels on the top-level schematic.
+    """Run fix_sheet_symbol_sizes and fix_subsheet_labels on EVERY schematic
+    file in the project, not just the top-level one.
+
+    Each file's own `(sheet ...)` blocks describe its own children (e.g.
+    MCU.kicad_sch describes DRAM/TPM, Power.kicad_sch describes its four
+    switcher sheets) -- running these passes only on the root left every
+    non-root sheet's own child sheet symbols unresized (oversized box, all
+    pins jammed on one side) and their own internal hier-label mismatches
+    unfixed, since neither pass used to look past the root's own direct
+    children. Neither pass converts a hierarchical_label's type based on
+    root-ness anymore -- that responsibility belongs to the generator
+    itself (see sch_postprocess.py's module docstring for why).
 
     Best-effort: silently no-ops if output_path or project_base_name are not
     available (e.g. exception before they were defined).
@@ -1344,10 +1355,13 @@ def _postprocess_schematic(
             fix_sheet_symbol_sizes,
             fix_subsheet_labels,
         )
-        fix_sheet_symbol_sizes(str(top_sch))
-        fix_subsheet_labels(str(top_sch))
+        all_sch = sorted(Path(output_path).glob("*.kicad_sch"))
+        for sch in all_sch:
+            fix_sheet_symbol_sizes(str(sch))
+        for sch in all_sch:
+            fix_subsheet_labels(str(sch))
         context_logger.info(
-            f"Schematic post-processing complete: {top_sch}",
+            f"Schematic post-processing complete: {len(all_sch)} sheet(s) under {output_path}",
             component="CIRCUIT",
         )
     except Exception as e:

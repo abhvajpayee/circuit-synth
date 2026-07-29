@@ -1111,15 +1111,108 @@ class SchematicWriter:
             f"🏁 PLACE_COMPONENTS: ✅ PLACEMENT COMPLETE in {total_time*1000:.2f}ms"
         )
 
+    def _own_net_names(self, circuit_name):
+        """Net names directly used by this circuit's own components (no recursion)."""
+        circ = self.all_subcircuits.get(circuit_name)
+        if circ is None:
+            return set()
+        nets = circ.nets.values() if isinstance(circ.nets, dict) else circ.nets
+        return {n.name for n in nets}
+
+    def _subtree_circuit_names(self, circuit_name):
+        """
+        Set of circuit names in `circuit_name`'s own subtree: itself plus every
+        descendant, transitively. Memoized per SchematicWriter instance (the
+        subcircuit dict is static for the duration of one generation run).
+        """
+        cache = getattr(self, "_subtree_circuit_names_cache", None)
+        if cache is None:
+            cache = self._subtree_circuit_names_cache = {}
+        if circuit_name in cache:
+            return cache[circuit_name]
+        circ = self.all_subcircuits.get(circuit_name)
+        if circ is None:
+            return set()
+        names = {circuit_name}
+        cache[circuit_name] = names  # placeholder guards against pathological cycles
+        for child_info in getattr(circ, "child_instances", []) or []:
+            names |= self._subtree_circuit_names(child_info.get("sub_name"))
+        cache[circuit_name] = names
+        return names
+
+    def _subtree_net_names(self, circuit_name):
+        """
+        Net names used anywhere in `circuit_name`'s own subtree: by the circuit
+        itself, or transitively by any of its descendants.
+
+        A wrapper circuit that only forwards its parameters to a child (no
+        direct component connections of its own -- e.g. a pure `child(*args)`
+        one-liner) never registers those nets into its own `.nets` -- a Net
+        only registers with whichever circuit is "current" when it is created
+        or connected to a component pin (see Net.__init__/`circuit.add_net`),
+        never merely by being received as a function parameter. This recursive
+        closure is what makes such a net still visible at the wrapper's level,
+        without relying on the wrapper itself ever touching it directly.
+        """
+        names = set()
+        for name in self._subtree_circuit_names(circuit_name):
+            names |= self._own_net_names(name)
+        return names
+
+    def _net_owner_circuits(self):
+        """
+        Reverse index: net name -> set of circuit names whose OWN components
+        directly use it. Memoized per SchematicWriter instance.
+        """
+        cache = getattr(self, "_net_owner_circuits_cache", None)
+        if cache is not None:
+            return cache
+        owners = {}
+        for name in self.all_subcircuits:
+            for net_name in self._own_net_names(name):
+                owners.setdefault(net_name, set()).add(name)
+        self._net_owner_circuits_cache = owners
+        return owners
+
+    def _net_crosses_boundary(self, circuit_name, net_name):
+        """
+        Does `net_name` cross `circuit_name`'s own sheet boundary -- i.e. is it
+        used both inside this circuit's subtree (by itself or a descendant)
+        AND by at least one circuit OUTSIDE that subtree (its parent, a
+        sibling, anywhere else in the design)?
+
+        This single, transitive definition replaces three separate, narrower
+        checks that used to disagree with each other:
+          - "shared with parent" (true boundary crossing -- kept, now as one
+            side of this test instead of a special case)
+          - "shared with a sibling" (also a real boundary crossing -- likewise
+            now just a case where the net is used outside this subtree)
+          - "used by a child" (previously treated as sufficient on its own --
+            wrong: a net used only by this circuit and its own descendants
+            never leaves this subtree, so it must stay a LOCAL label tying
+            this circuit's own canvas to its child's sheet pin, not a
+            hierarchical one claiming to cross a boundary nothing needs it to
+            cross)
+
+        Note this must compare OWNER CIRCUIT NAMES against subtree membership,
+        not net-name sets against each other: the net name being tested is,
+        by construction, always present inside the subtree too (that's the
+        first condition below), so a naive "all names minus subtree names"
+        set difference would always discard it and never detect a genuine
+        outside use under the same name.
+        """
+        subtree = self._subtree_circuit_names(circuit_name)
+        owners = self._net_owner_circuits().get(net_name, set())
+        if not (owners & subtree):
+            return False  # not even used inside this subtree
+        return bool(owners - subtree)
+
     def _is_net_hierarchical(self, net_obj):
         """
-        Check if a net should have a hierarchical label (vs local label).
-
-        A net needs a hierarchical label if it:
-        1. Is shared with the parent circuit (passed as parameter), OR
-        2. Is used by any child circuit (needs to connect down to children)
-
-        Local labels are ONLY for nets that are purely internal to this sheet.
+        Check if a net should have a hierarchical label (vs local label): true
+        iff the net crosses this circuit's own sheet boundary (see
+        _net_crosses_boundary). Nets purely internal to this sheet's own
+        subtree get a plain LOCAL label.
 
         Args:
             net_obj: The Net object to check
@@ -1127,56 +1220,10 @@ class SchematicWriter:
         Returns:
             bool: True if net should have hierarchical label, False for local label
         """
-        # A net needs a HIERARCHICAL label (and a matching sheet pin) only if it
-        # crosses this sheet's boundary: shared with the parent circuit, or used
-        # by a child circuit. Nets that are purely internal to this sheet get a
-        # plain LOCAL label. This mirrors the sheet-pin logic in
-        # _add_subcircuit_sheets (which only exposes shared nets as pins).
-        #
-        # Matching is by Net-object identity with a name-based fallback, because
-        # circuits are reconstructed from JSON and object identity does not
-        # survive that round-trip.
         net_name = getattr(net_obj, "name", None)
-
-        def _net_names(circ):
-            if circ is None:
-                return set()
-            nets = circ.nets.values() if isinstance(circ.nets, dict) else circ.nets
-            return {n.name for n in nets}
-
-        # Find this sheet's parent circuit (the one whose children include it).
-        parent = None
-        for circ in self.all_subcircuits.values():
-            for child_info in getattr(circ, "child_instances", []) or []:
-                if child_info.get("sub_name") == self.circuit.name:
-                    parent = circ
-                    break
-            if parent is not None:
-                break
-
-        if parent is not None:
-            # 1) Shared with the parent sheet?
-            if net_name in _net_names(parent):
-                return True
-            # 2) Shared with a SIBLING sheet (another child of the same parent)?
-            #    A net created in the parent and passed into two children, with no
-            #    parent-sheet component on it, lives only in the children. It still
-            #    must cross between them, so it needs a hierarchical label + sheet
-            #    pin in each child (and matching labels in the parent).
-            for sib in getattr(parent, "child_instances", []) or []:
-                if sib.get("sub_name") == self.circuit.name:
-                    continue
-                if net_name in _net_names(self.all_subcircuits.get(sib.get("sub_name"))):
-                    return True
-
-        # 3) Used by one of this sheet's own children?
-        for child_info in getattr(self.circuit, "child_instances", []) or []:
-            child_circ = self.all_subcircuits.get(child_info.get("sub_name"))
-            if net_name in _net_names(child_circ):
-                return True
-
-        # Otherwise it is internal to this sheet -> local label.
-        return False
+        if net_name is None:
+            return False
+        return self._net_crosses_boundary(self.circuit.name, net_name)
 
     def _add_power_symbol(
         self,
@@ -2192,113 +2239,21 @@ class SchematicWriter:
 
             child_circ = self.all_subcircuits[sub_name]
 
-            # Get only SHARED nets for this subcircuit to create sheet pins
-            # Check which child nets have the SAME OBJECT REFERENCE as parent nets
-            # (not just matching names - must be the same Net object passed from parent to child)
-
-            shared_net_names = []
-            internal_net_names = []
-
-            # Handle both dict and list forms of .nets
-            child_nets = list(
-                child_circ.nets.values()
-                if isinstance(child_circ.nets, dict)
-                else child_circ.nets
+            # A net is exposed as a sheet pin on this child's symbol iff it
+            # crosses the CHILD's own boundary: used somewhere inside the
+            # child's subtree (by the child itself or transitively by one of
+            # its own descendants) AND also used somewhere outside it (by
+            # this circuit, a sibling, or anywhere else in the design). See
+            # _net_crosses_boundary for the full rationale -- this single,
+            # transitive test replaces the old identity/name matching against
+            # only this circuit's and its siblings' OWN direct nets, which
+            # missed any net whose only local use was several levels down
+            # (e.g. a wrapper circuit with no direct component connections of
+            # its own forwarding straight into a grandchild).
+            child_net_names = self._subtree_net_names(sub_name)
+            pin_list = sorted(
+                n for n in child_net_names if self._net_crosses_boundary(sub_name, n)
             )
-            parent_nets = list(
-                self.circuit.nets.values()
-                if isinstance(self.circuit.nets, dict)
-                else self.circuit.nets
-            )
-
-            # A child net is exposed as a sheet pin if it crosses the child's
-            # boundary, i.e. it is shared with the parent OR with a sibling child.
-            # Object identity covers Python-built circuits; name covers JSON-loaded
-            # ones. Sibling sharing matters when a net is created in the parent and
-            # passed into two children with no parent-sheet component on it (it then
-            # lives only in the children but still must connect between them).
-            parent_net_ids = {id(n) for n in parent_nets}
-            parent_net_names = {n.name for n in parent_nets}
-
-            sibling_net_names = set()
-            for sibling_info in self.circuit.child_instances:
-                if sibling_info["sub_name"] == sub_name:
-                    continue
-                sib = self.all_subcircuits.get(sibling_info["sub_name"])
-                if sib is None:
-                    continue
-                sib_nets = sib.nets.values() if isinstance(sib.nets, dict) else sib.nets
-                sibling_net_names.update(n.name for n in sib_nets)
-
-            for child_net in child_nets:
-                if (
-                    id(child_net) in parent_net_ids
-                    or child_net.name in parent_net_names
-                    or child_net.name in sibling_net_names
-                ):
-                    shared_net_names.append(child_net.name)
-                else:
-                    internal_net_names.append(child_net.name)
-
-            pin_list = sorted(set(shared_net_names))
-
-            # CRITICAL FIX: Also include the parameters from child circuit instances
-            # For subcircuits that only contain other subcircuits (no components),
-            # the parameters won't show up as nets, so we need to extract them from
-            # the instance connections
-            if hasattr(child_info, "instance_nets") and child_info.get("instance_nets"):
-                # If instance_nets mapping is available, use it
-                instance_nets = child_info["instance_nets"]
-                for param_name, net_name in instance_nets.items():
-                    if net_name not in pin_list:
-                        pin_list.append(net_name)
-                pin_list = sorted(pin_list)
-            elif (
-                len(child_circ.components) == 0 and len(child_circ.child_instances) > 0
-            ):
-                # This is a hierarchical sheet with only subcircuits
-                # We need to infer the parameters from the parent circuit's nets
-                # that connect to this subcircuit instance
-                logger.debug(
-                    f"Subcircuit '{sub_name}' has no components, checking parent connections"
-                )
-
-                # Look for nets in the parent circuit that might connect to this instance
-                # This is a heuristic approach - ideally we'd have explicit parameter info
-                parent_nets = set()
-                for net in self.circuit.nets:
-                    # Add all parent nets as potential connections
-                    # In a more sophisticated implementation, we'd track which nets
-                    # actually connect to this specific subcircuit instance
-                    parent_nets.add(net.name)
-
-                # For now, use common signal names that are likely to be hierarchical connections
-                common_hierarchical_signals = [
-                    "VCC",
-                    "GND",
-                    "VIN",
-                    "VOUT",
-                    "INPUT",
-                    "OUTPUT",
-                    "FILTERED",
-                    "PROCESSED",
-                    "V_MONITOR",
-                ]
-                for signal in common_hierarchical_signals:
-                    if signal in parent_nets and signal not in pin_list:
-                        pin_list.append(signal)
-
-                # Also check the subcircuit's child instances to infer parameters
-                for child_inst in child_circ.child_instances:
-                    child_sub = self.all_subcircuits.get(child_inst["sub_name"])
-                    if child_sub:
-                        # Add any nets from child subcircuits that might be parameters
-                        for net in child_sub.nets:
-                            if net.name not in pin_list and net.name in parent_nets:
-                                pin_list.append(net.name)
-
-                pin_list = sorted(pin_list)
-                logger.info(f"Inferred hierarchical pins for '{sub_name}': {pin_list}")
 
             # Use pre-calculated position and size from placement
             # These were set by _place_components() text-flow algorithm
@@ -2357,12 +2312,44 @@ class SchematicWriter:
                     f"Created sheet pin '{net_name}' at position ({pin_x}, {pin_y})"
                 )
 
+                # This label ties THIS circuit's own canvas to the child's
+                # sheet pin -- it only needs to be HIERARCHICAL if net_name
+                # ALSO crosses this circuit's own boundary (i.e. is also
+                # needed by this circuit's own parent). A net shared only
+                # between this circuit and this one child never leaves this
+                # sheet, so a plain LOCAL label is correct and sufficient:
+                # same-sheet name matching already ties it to whatever else
+                # (a component pin, or this circuit's own boundary
+                # hierarchical_label) uses the same name here.
+                tie_is_hierarchical = self._net_crosses_boundary(
+                    self.circuit.name, net_name
+                )
+                # NOTE: label_x is deliberately pin_x (the sheet's own raw,
+                # unshifted right edge), NOT pin_x - 1.27 (the SheetPin's own
+                # stored position, offset 1.27mm inside the edge for its
+                # arrow-glyph rendering). sch_postprocess.py's
+                # fix_sheet_symbol_sizes() keys its label-repositioning
+                # lookup on this exact unshifted edge value (`old_right_x =
+                # sx + cur_w`, matching this sheet's own bounding box) to find
+                # and move these tie labels after a sheet gets resized/its
+                # pins split left-right. Moving this label to coincide with
+                # the SheetPin's own position instead (tried 2026-07-28, to
+                # let bus_emit.py position-match a tie label against a
+                # child's own reported pin position) broke that lookup
+                # project-wide -- every tie label silently stopped being
+                # found and repositioned, regardless of whether it was
+                # anywhere near a bus. bus_emit.py instead accounts for this
+                # known, fixed 1.27mm offset itself (see
+                # _sheet_pin_positions in bus_emit.py) rather than this
+                # generation-time position changing to suit it.
                 label_x = pin_x
                 label = Label(
                     uuid=str(uuid_module.uuid4()),
                     position=Point(label_x, pin_y),
                     text=net_name,
-                    label_type=LabelType.HIERARCHICAL,
+                    label_type=(
+                        LabelType.HIERARCHICAL if tie_is_hierarchical else LabelType.LOCAL
+                    ),
                     rotation=0.0,
                 )
 

@@ -5,15 +5,32 @@ These correct known circuit-synth generation artefacts:
 
   fix_sheet_symbol_sizes()
     - Sheet symbol boxes are sized from len(sub_circ.nets) (all internal nets),
-      making them 4–5× taller than the boundary pin count requires.
+      making them 4-5x taller than the boundary pin count requires.
     - Pins are emitted on the right side only.
-    - Root-level hierarchical_label elements fail KiCad 10 ERC
-      ("cannot be connected to non-existent parent sheet").
 
   fix_subsheet_labels()
     - Internal/power nets in sub-sheets are sometimes marked as
       hierarchical_label even when no parent sheet pin exposes them,
       causing KiCad 10 ERC 'hier_label_mismatch' violations.
+
+Neither pass converts a `hierarchical_label`'s TYPE (e.g. root-level
+hierarchical_label -> plain label). That conversion used to live here, but
+was removed 2026-07-29: a root sheet (no parent of its own) can never have a
+valid hierarchical_label -- there is no parent sheet symbol it could ever
+match -- so the generator itself (schematic_writer.py's
+`_net_crosses_boundary`, which returns False for the root's own boundary
+check by construction: the root's own subtree always covers the entire
+project, so there is never a circuit "outside" it) must simply never emit
+one there in the first place. Patching a wrong TYPE back to correct here,
+after the fact, would silently mask any future regression in that generator
+logic -- a root-level hierarchical_label would stop being an ERC failure
+that gets noticed and fixed at the source, and instead become invisible
+output that happens to still be valid. Confirmed empirically (both with and
+without bus injection) that a current, correct generator run already
+produces zero hierarchical_label elements in the root file on its own, so
+this file no longer needs to compensate for it. If a root-level
+hierarchical_label ever reappears, that is a generator bug to fix in
+schematic_writer.py/bus_emit.py, not something to re-patch here.
 """
 
 from __future__ import annotations
@@ -23,14 +40,28 @@ import re
 from pathlib import Path
 
 
-def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
+def fix_sheet_symbol_sizes(sch_path: str) -> None:
     """
-    Resize every hierarchical sheet symbol in the top-level schematic to match
-    its actual pin count, split pins across LEFT and RIGHT sides (first
-    ceil(n/2) on left, rest on right) to halve box height, and convert all
-    root-level hierarchical_labels to net labels for KiCad 10 compatibility.
+    Resize every hierarchical sheet symbol in `sch_path` to match its actual
+    pin count, split pins across LEFT and RIGHT sides (first ceil(n/2) on
+    left, rest on right) to halve box height, and track that repositioning
+    into every tie label (whether `label` or `hierarchical_label`) that
+    connects to one of those pins. Never changes a label's TYPE (hierarchical
+    vs. local) -- only its position and justify -- see the module docstring
+    for why that conversion doesn't belong here.
+
+    Must be called on EVERY schematic file in a hierarchical project, not
+    just the true root -- each file's OWN `(sheet ...)` blocks describe ITS
+    OWN children (e.g. MCU.kicad_sch describes DRAM/TPM), and those need
+    the identical resize/split treatment the root's own children get.
+    Calling this only on the root leaves every non-root sheet's own child
+    sheet symbols at their original, oversized, right-side-only-pin layout
+    (found 2026-07-28: e.g. MCU's own DRAM sheet symbol stayed at
+    25.4x116.84mm with all 26 pins jammed on one side, while sibling sheet
+    symbols on the actual root were correctly resized to 28x50.8mm with
+    pins split left/right).
     """
-    path = Path(top_sch_path)
+    path = Path(sch_path)
     lines = path.read_text().splitlines(keepends=True)
 
     PIN_PITCH    = 2.54    # mm grid
@@ -179,8 +210,11 @@ def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
             i = block_end
             continue
 
-        # Convert every hierarchical_label → net label (KiCad 10: root-sheet
-        # hierarchical_labels have no parent to connect to and fail ERC).
+        # Reposition in place only -- never convert the label's type. A
+        # hierarchical_label here always legitimately needs to reach this
+        # sheet's own real parent one level up (see module docstring for why
+        # the generator itself, not this pass, is responsible for never
+        # emitting one on the true root, where no such parent exists).
         if re.match(r'\t\(hierarchical_label\s+"', lines[i]):
             hl_block = [lines[i]]
             i += 1; depth = 1
@@ -211,11 +245,7 @@ def fix_sheet_symbol_sizes(top_sch_path: str) -> None:
 
             new_hl: list[str] = []
             for j, ln in enumerate(hl_block):
-                if j == 0:
-                    ln = re.sub(r'\(hierarchical_label\s+', '(label ', ln)
-                elif re.match(r'\t\t\(shape\s+', ln):
-                    continue
-                elif at_line_idx is not None and j == at_line_idx:
+                if at_line_idx is not None and j == at_line_idx:
                     ln = f'\t\t(at {final_x:.4f} {final_y:.4f} {final_angle:.4f})\n'
                 elif re.match(r'\t\t\t\(justify\s+', ln):
                     ln = f'\t\t\t(justify {new_justify})\n'

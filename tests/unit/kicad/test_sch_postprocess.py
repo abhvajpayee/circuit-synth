@@ -374,24 +374,33 @@ def test_mixed_integer_and_decimal_angle_pins_no_collision(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
-# fix_sheet_symbol_sizes — hierarchical_label → label conversion
+# fix_sheet_symbol_sizes — hierarchical_label repositioning (type preserved)
 # ---------------------------------------------------------------------------
+#
+# A hierarchical_label's TYPE is never converted here (removed 2026-07-29):
+# a non-root sheet's hierarchical_label legitimately needs to reach that
+# sheet's own real parent one level up, so converting it to a plain label
+# would silently break that. Only the true root can never have a valid
+# hierarchical_label at all, and that is the generator's own responsibility
+# to never emit in the first place (schematic_writer.py's
+# _net_crosses_boundary) -- not something this pass patches after the fact.
+# These tests only check repositioning/justify tracking, which applies
+# identically regardless of root-ness.
 
-def test_hl_converted_to_label(tmp_path: Path) -> None:
+def test_hl_stays_hierarchical(tmp_path: Path) -> None:
     sch = tmp_path / "top.kicad_sch"
     sch.write_text(_top(["CLK", "DATA"]))
     fix_sheet_symbol_sizes(str(sch))
     text = sch.read_text()
-    assert "(hierarchical_label" not in text
-    assert '(label "CLK"' in text
-    assert '(label "DATA"' in text
+    assert '(hierarchical_label "CLK"' in text
+    assert '(hierarchical_label "DATA"' in text
 
 
-def test_hl_shape_line_removed(tmp_path: Path) -> None:
+def test_hl_shape_line_preserved(tmp_path: Path) -> None:
     sch = tmp_path / "top.kicad_sch"
     sch.write_text(_top(["CLK"]))
     fix_sheet_symbol_sizes(str(sch))
-    assert "(shape" not in sch.read_text()
+    assert "(shape" in sch.read_text()
 
 
 def test_hl_position_moved_to_left_pin(tmp_path: Path) -> None:
@@ -419,8 +428,9 @@ def test_hl_justify_left_bottom_for_right_pin(tmp_path: Path) -> None:
     assert "(justify left bottom)" in sch.read_text()
 
 
-def test_unmatched_hl_still_converted(tmp_path: Path) -> None:
-    """HL with no matching sheet pin is still converted to a net label (no crash)."""
+def test_unmatched_hl_untouched(tmp_path: Path) -> None:
+    """HL with no matching sheet pin is left as-is: still hierarchical_label,
+    at its original position (no crash)."""
     content = (
         '(kicad_sch (version 20211123) (generator circuit_synth)\n'
         + _hl("ORPHAN", 50.0, 50.0, 0.0)
@@ -430,8 +440,8 @@ def test_unmatched_hl_still_converted(tmp_path: Path) -> None:
     sch.write_text(content)
     fix_sheet_symbol_sizes(str(sch))
     text = sch.read_text()
-    assert "(hierarchical_label" not in text
-    assert '(label "ORPHAN"' in text
+    assert '(hierarchical_label "ORPHAN"' in text
+    assert "(at 50.0000 50.0000 0.0000)" in text
 
 
 # ---------------------------------------------------------------------------
