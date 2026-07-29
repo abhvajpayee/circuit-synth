@@ -2479,12 +2479,53 @@ class SchematicWriter:
         - No components (len(self.circuit.components) == 0)
         - Child subcircuits (len(self.circuit.child_instances) > 0)
 
-        These sheets need hierarchical labels to connect parent sheet pins
-        to child sheet pins, allowing signals to flow through.
+        `_add_subcircuit_sheets` (which always runs first) already creates,
+        for every net crossing THIS circuit's own boundary, a tie
+        label/hierarchical_label at that net's child-pin position -- typed
+        `hierarchical_label` whenever the net also needs to keep going
+        further up (exactly the condition this method cares about). Once
+        that exists, THIS circuit's own file already carries a
+        hierarchical_label with the right name, which is all a sheet-pin
+        in the PARENT's file needs to resolve the connection: KiCad matches
+        a sheet symbol's pin to a hierarchical_label purely by NAME within
+        the child file, not by position (position only matters for
+        circuit-synth's own postprocessing/bus-injection bookkeeping
+        elsewhere in this module, e.g. `_TIE_LABEL_X_OFFSET`'s comment).
 
-        For each pin on this sheet's symbol in the parent:
-        1. Create hierarchical_label to receive signal from parent
-        2. Create plain label connecting to child sheet pins with same name
+        So for any `parent_pins` entry whose name is already covered by one
+        of `_add_subcircuit_sheets`'s own hierarchical_labels, this method
+        has nothing left to add -- and historically it added the wrong
+        thing anyway: an extra hierarchical_label at the boundary-facing
+        (parent-supplied) position, PLUS a "connecting" plain label placed
+        (by a since-fixed bug) at that SAME boundary position rather than
+        anywhere near the child's own tie point, so it never actually
+        bridged anything. Both were floating, self-referential duplicates
+        that ERC otherwise treats as a harmless closed loop -- delete
+        either one WITHOUT the other and the remaining occurrence becomes a
+        genuinely dangling, disconnected hierarchical_label instead
+        (`label_dangling`), since nothing else sits at its point and
+        nothing else on this sheet shares its name once the child-tie
+        hierarchical_label is skipped over.
+
+        Only emits its own hierarchical_label (no companion label needed)
+        for the remaining case: a `parent_pins` entry with no matching
+        same-named hierarchical_label from `_add_subcircuit_sheets` at all
+        -- e.g. the net's own child-side tie was typed as a plain LOCAL
+        label (net doesn't need to travel past that one child), yet this
+        circuit's OWN boundary still needs to forward it further up.
+
+        Found and fixed 2026-07-29 via a user hand-edit to PowerSetup.kicad_sch
+        (removing PG_14V0/PG_3V6/etc.'s redundant boundary
+        hierarchical_label + connecting label pair, keeping only
+        `_add_subcircuit_sheets`'s own child-tie hierarchical_label) --
+        confirmed ERC-neutral (152 violations, unchanged) for that specific
+        case, then generalized here. Two earlier, less careful attempts at
+        generalizing this (deleting the connecting label outright; then
+        moving it to the child's own tie point instead) both regressed ERC
+        broadly (185 violations, 33 label_dangling) by leaving the boundary
+        hierarchical_label without its same-position companion in cases
+        that still needed the ORIGINAL two-item mechanism -- the actual
+        fix is to skip the whole pair, not patch the companion.
         """
         # Only process if this is an intermediate sheet
         is_intermediate = (
@@ -2499,13 +2540,29 @@ class SchematicWriter:
         if not self.parent_pins:
             return
 
-        logger.debug(f"Adding {len(self.parent_pins)} hierarchical labels for intermediate sheet '{self.circuit.name}'")
+        # Names already covered by _add_subcircuit_sheets's own child-tie
+        # hierarchical_labels (see docstring) -- these need nothing further.
+        already_hierarchical = {
+            hl.get("text")
+            for hl in self.schematic._data.get("hierarchical_labels", [])
+        }
+
+        remaining_pins = [
+            (pin_name, pin_position, pin_type)
+            for pin_name, pin_position, pin_type in self.parent_pins
+            if pin_name not in already_hierarchical
+        ]
+
+        if not remaining_pins:
+            return
+
+        logger.debug(f"Adding {len(remaining_pins)} hierarchical labels for intermediate sheet '{self.circuit.name}'")
 
         # Import helper for label justification
         from ..schematic.label_utils import calculate_hierarchical_label_justify
 
-        # For each pin from parent sheet symbol
-        for pin_name, pin_position, pin_type in self.parent_pins:
+        # For each pin from parent sheet symbol not already tied by a child
+        for pin_name, pin_position, pin_type in remaining_pins:
             # Create hierarchical label at the pin position to receive signal from parent
             # Use angle 180 (pointing left into the sheet) to match parent's outward-facing pin
             angle = 180.0
@@ -2527,30 +2584,21 @@ class SchematicWriter:
 
             logger.debug(f"  Created hierarchical_label '{pin_name}' at ({pin_position.x}, {pin_position.y})")
 
-            # Find which child sheet(s) have a pin with this name and create connecting labels
-            for child_info in self.circuit.child_instances:
-                sub_name = child_info["sub_name"]
-
-                # Check if this child has this pin
-                if sub_name in self.child_sheet_pins:
-                    child_pins = self.child_sheet_pins[sub_name]
-                    for child_pin_name, child_pin_pos, child_pin_type in child_pins:
-                        if child_pin_name == pin_name:
-                            # Create a plain label at the hierarchical_label position
-                            # connecting it to the child sheet pin
-                            label_dict = {
-                                "uuid": str(uuid_module.uuid4()),
-                                "position": {"x": pin_position.x, "y": pin_position.y},
-                                "text": pin_name,
-                                "rotation": angle,
-                                "size": 1.27,
-                            }
-
-                            if "labels" not in self.schematic._data:
-                                self.schematic._data["labels"] = []
-                            self.schematic._data["labels"].append(label_dict)
-
-                            logger.debug(f"    Created connecting label for child sheet '{sub_name}'")
+            # This hierarchical_label has nothing else at its own point (no
+            # wire, no pin) -- give it a same-position, same-name plain-label
+            # companion so it isn't a lone, disconnected occurrence (see
+            # docstring: this is the ORIGINAL, still-necessary half of the
+            # mechanism for the case this loop now only reaches).
+            label_dict = {
+                "uuid": str(uuid_module.uuid4()),
+                "position": {"x": pin_position.x, "y": pin_position.y},
+                "text": pin_name,
+                "rotation": angle,
+                "size": 1.27,
+            }
+            if "labels" not in self.schematic._data:
+                self.schematic._data["labels"] = []
+            self.schematic._data["labels"].append(label_dict)
 
     def _create_component_units(
         self, component_labels: Dict[str, List[Label]]
