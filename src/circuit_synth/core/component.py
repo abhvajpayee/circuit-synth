@@ -44,6 +44,7 @@ class Component(SimplifiedPinAccess):
     footprint: Optional[str] = None
     datasheet: Optional[str] = None
     description: Optional[str] = None
+    doc: Optional[Dict[str, str]] = None
 
     _extra_fields: Dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -70,6 +71,7 @@ class Component(SimplifiedPinAccess):
         footprint: Optional[str] = None,
         datasheet: Optional[str] = None,
         description: Optional[str] = None,
+        doc: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         """
@@ -82,6 +84,17 @@ class Component(SimplifiedPinAccess):
             footprint: KiCad footprint reference
             datasheet: URL to component datasheet
             description: Component description
+            doc: Optional documentation metadata, e.g.
+                ``{"what": "TPM I2C-select pull-down", "why": "...",
+                "reference": "ADR-0024"}``. Freeform dict of string keys;
+                "what"/"why"/"reference" are the conventional keys used by
+                :func:`circuit_synth.core.component_dictionary.export_component_dictionary`,
+                but any keys are accepted and preserved. Not rendered onto
+                the schematic -- purely a source-level, exportable annotation
+                for design-rationale documentation (BOM/design-dictionary
+                generation). None (default) means no metadata was authored
+                for this component; fully backward compatible with existing
+                call sites.
             **kwargs: Additional fields (e.g., mfg_part_num, tolerance, etc.)
         """
         # Initialize the fields that are normally handled by dataclass first
@@ -98,6 +111,7 @@ class Component(SimplifiedPinAccess):
         self.footprint = footprint
         self.datasheet = datasheet
         self.description = description
+        self.doc = doc
 
         # Store any additional keyword arguments in _extra_fields (validation happens later)
         for key, value in kwargs.items():
@@ -392,6 +406,7 @@ class Component(SimplifiedPinAccess):
             footprint=self.footprint,
             datasheet=self.datasheet,
             description=self.description,
+            doc=self.doc,
         )
         for k, v in self._extra_fields.items():
             setattr(new_c, k, v)
@@ -430,6 +445,7 @@ class Component(SimplifiedPinAccess):
             "datasheet": self.datasheet or "",  # Ensure empty string instead of None
             "description": self.description
             or "",  # Ensure empty string instead of None
+            "doc": self.doc,  # Optional documentation metadata dict, or None
             "properties": properties,  # Add standard properties dict
             "_extra_fields": dict(
                 self._extra_fields
@@ -478,6 +494,7 @@ class Component(SimplifiedPinAccess):
             footprint=data.get("footprint"),
             datasheet=data.get("datasheet"),
             description=data.get("description"),
+            doc=data.get("doc"),
         )
 
         known_top = {
@@ -487,6 +504,7 @@ class Component(SimplifiedPinAccess):
             "footprint",
             "datasheet",
             "description",
+            "doc",
             "pins",
             "_extra_fields",
         }

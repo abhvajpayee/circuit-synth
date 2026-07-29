@@ -627,6 +627,7 @@ class Circuit:
         generate_ratsnest: bool = True,
         update_source_refs: Optional[bool] = None,
         preserve_user_components: bool = False,
+        export_component_dictionary: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate a complete KiCad project (schematic + PCB) from this circuit.
@@ -649,12 +650,26 @@ class Circuit:
             preserve_user_components: Keep components in KiCad that don't exist in Python (default: False)
                                      False: Python is source of truth - delete components not in Python
                                      True: Preserve all components in KiCad, even if not in Python
+            export_component_dictionary: If True, also write a
+                                     `component_dictionary.json` file into the
+                                     project directory containing every
+                                     component's `doc=` metadata (see
+                                     `Component.doc` /
+                                     `circuit_synth.core.component_dictionary.
+                                     export_component_dictionary`), collected
+                                     recursively across this circuit's full
+                                     subcircuit hierarchy. Components with no
+                                     `doc` metadata are omitted. Default False
+                                     (no behavior change for existing callers).
 
         Returns:
             dict: Result dictionary containing:
                 - success (bool): Whether generation succeeded
                 - json_path (Path): Path to the canonical JSON netlist
                 - project_path (Path): Path to the KiCad project directory
+                - component_dictionary_path (Path, optional): Path to the
+                  written component_dictionary.json, present only when
+                  export_component_dictionary=True and generation succeeded
                 - error (str, optional): Error message if generation failed
 
         Example:
@@ -808,11 +823,29 @@ class Circuit:
                 _postprocess_schematic(output_path, project_base_name, context_logger)
 
                 # Return success result with JSON path
-                return {
+                result_dict = {
                     "success": True,
                     "json_path": json_path,
                     "project_path": output_path,
                 }
+
+                if export_component_dictionary:
+                    try:
+                        from .component_dictionary import (
+                            write_component_dictionary_json,
+                        )
+
+                        cd_path = write_component_dictionary_json(
+                            self, output_path / "component_dictionary.json"
+                        )
+                        result_dict["component_dictionary_path"] = cd_path
+                    except Exception as e:  # best-effort, never fatal to generation
+                        context_logger.warning(
+                            f"Component dictionary export skipped: {e}",
+                            component="CIRCUIT",
+                        )
+
+                return result_dict
             else:
                 error_msg = result.get(
                     "error", "Unknown error occurred during project generation"

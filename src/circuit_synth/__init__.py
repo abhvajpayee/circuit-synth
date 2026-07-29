@@ -111,6 +111,8 @@ from .core import (
     find_replaceable_components,
     replace_components,
     replace_multiple,
+    export_component_dictionary,
+    write_component_dictionary_json,
 )
 
 # Annotation imports
@@ -187,6 +189,9 @@ __all__ = [
     "replace_multiple",
     "find_replaceable_components",
     "ReplacementResult",
+    # Component documentation-metadata export
+    "export_component_dictionary",
+    "write_component_dictionary_json",
     # Annotations
     "TextProperty",
     "TextBox",

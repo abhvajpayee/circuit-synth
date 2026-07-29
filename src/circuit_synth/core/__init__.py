@@ -4,6 +4,10 @@ Core circuit primitives and utilities
 
 from .circuit import Circuit
 from .component import Component
+from .component_dictionary import (
+    export_component_dictionary,
+    write_component_dictionary_json,
+)
 from .component_replacement import (
     ReplacementResult,
     find_replaceable_components,
@@ -43,4 +47,7 @@ __all__ = [
     "replace_multiple",
     "find_replaceable_components",
     "ReplacementResult",
+    # Component documentation-metadata export
+    "export_component_dictionary",
+    "write_component_dictionary_json",
 ]
