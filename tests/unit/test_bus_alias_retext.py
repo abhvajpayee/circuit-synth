@@ -284,3 +284,102 @@ def test_root_sheet_bus_erc_clean(tmp_path):
         if v["type"] in bad_types
     ]
     assert not violations, f"root-sheet bus ERC violations: {violations}"
+
+
+def _plain_vector_bus_circuit():
+    """Root sheet -> two sibling leaf sheets, each with real component
+    connections to >=2 members of a plain (non-aliased) vector Bus. Deliberately
+    NOT aliased -- this is the minimal shape that reproduces wayfinder #55:
+    a genuine incremental-sync (force_regenerate=False) round-trip through
+    APISynchronizer, which loads/saves via kicad-sch-api. kicad-sch-api's
+    Schematic.load() has no parser support for the native KiCad `bus`/
+    `bus_entry` element types -- confirmed directly: a bare load+save
+    round-trip of a file containing them drops both unconditionally, for
+    either preserve_format setting, because load() never captures them into
+    its own `_data` model at all. That silently strips the vector-bus
+    graphic each leaf sheet's `inject_buses()` pass drew (the bus wire + its
+    per-tap `bus_entry`), while leaving the (properly-modeled) per-tap stub
+    `wire` and its end `label` behind -- orphaning the stub wire's bus-side
+    endpoint, which is exactly KiCad ERC's `unconnected_wire_endpoint`."""
+
+    @circuit(name="leaf_a")
+    def leaf_a(bus, gnd):
+        for i in range(3):
+            r = Component("Device:R", ref="R", value="1k")
+            r[1] += bus.members[i]
+            r[2] += gnd
+
+    @circuit(name="leaf_b")
+    def leaf_b(bus, gnd):
+        for i in range(3):
+            r = Component("Device:R", ref="R", value="2k")
+            r[1] += bus.members[i]
+            r[2] += gnd
+
+    @circuit(name="root")
+    def root():
+        from circuit_synth import Net
+
+        gnd = Net("GND")
+        data = Bus("DATA", width=3)
+        leaf_a(data, gnd)
+        leaf_b(data, gnd)
+
+    return root()
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="kicad-cli not available")
+def test_incremental_sync_does_not_orphan_bus_stub_wires(tmp_path):
+    """Regression test for wayfinder #55: running circuit-synth's incremental
+    sync (generate_kicad_project with force_regenerate=False, the path
+    APISynchronizer.sync_with_circuit() is reached through) against an
+    already-generated project with a cross-sheet vector Bus must not
+    introduce new `unconnected_wire_endpoint` ERC violations, even with zero
+    Python source changes between the two generate_kicad_project() calls.
+
+    This is a pure idempotency check: fresh generate (force_regenerate=True,
+    never touches APISynchronizer) establishes a clean baseline; the SECOND
+    call (force_regenerate defaults to False, and the project now exists, so
+    this is the real incremental-sync path) must reproduce the identical ERC
+    violation set on the root sheet -- not just the same count, the same
+    category breakdown."""
+    import json
+
+    circ = _plain_vector_bus_circuit()
+    proj_dir = str(tmp_path / "sb")
+    circ.generate_kicad_project(proj_dir, generate_pcb=False, force_regenerate=True)
+
+    root_file = os.path.join(proj_dir, "root.kicad_sch")
+
+    def _erc_violation_types(out_path):
+        subprocess.run(
+            ["kicad-cli", "sch", "erc", "-o", out_path, "--format", "json",
+             "--severity-all", root_file],
+            capture_output=True, text=True,
+        )
+        data = json.load(open(out_path))
+        counts = {}
+        for sheet in data.get("sheets", []):
+            for v in sheet.get("violations", []):
+                counts[v["type"]] = counts.get(v["type"], 0) + 1
+        return counts
+
+    baseline = _erc_violation_types(str(tmp_path / "erc_baseline.json"))
+    assert "unconnected_wire_endpoint" not in baseline, (
+        f"fresh generation should never have dangling wire endpoints: {baseline}"
+    )
+
+    # The incremental-sync call: same circuit, same project dir, no Python
+    # source changes, force_regenerate left at its False default.
+    circ2 = _plain_vector_bus_circuit()
+    circ2.generate_kicad_project(proj_dir, generate_pcb=False)
+
+    after_sync = _erc_violation_types(str(tmp_path / "erc_after_sync.json"))
+    assert "unconnected_wire_endpoint" not in after_sync, (
+        "incremental sync introduced dangling bus-stub wire endpoints "
+        f"(wayfinder #55 regression): {after_sync}"
+    )
+    assert after_sync == baseline, (
+        "incremental sync changed the ERC violation profile on an unchanged "
+        f"circuit: baseline={baseline}, after_sync={after_sync}"
+    )

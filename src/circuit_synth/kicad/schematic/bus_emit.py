@@ -141,6 +141,190 @@ def _snap(v, grid=_GRID):
     return round(round(v / grid) * grid, 2)
 
 
+def _top_level_block_spans(txt):
+    """Return [(start, end), ...] character spans for every top-level
+    ``\\t(...)`` s-expression element in `txt` (one KiCad schematic
+    element per span: a component, wire, label, bus, bus_entry, etc.).
+
+    Paren-depth scan rather than a fixed-format regex, because elements
+    that have round-tripped through kicad-sch-api's own formatter (see
+    `inject_buses`' orphaned-bus-graphic handling below) are reformatted
+    into a different, multi-line style (e.g. `(effects\\n (font ...)\\n
+    (justify ...))` instead of this module's own single-line
+    `(effects (font ...) (justify ...))`), so a regex tied to this
+    module's own emission templates cannot reliably match them back."""
+    spans = []
+    i, n = 0, len(txt)
+    while i < n:
+        if txt[i] == "\t" and i + 1 < n and txt[i + 1] == "(":
+            depth = 0
+            j = i + 1
+            while j < n:
+                if txt[j] == "(":
+                    depth += 1
+                elif txt[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                j += 1
+            end = j + 1 if j < n and txt[j] == "\n" else j
+            spans.append((i, end))
+            i = end
+        else:
+            i += 1
+    return spans
+
+
+def _block_at_xy(block_text):
+    """First `(at X Y ...)` point in a block, or None."""
+    m = re.search(r"\(at ([0-9.\-]+) ([0-9.\-]+)", block_text)
+    return (float(m.group(1)), float(m.group(2))) if m else None
+
+
+def _block_wire_endpoints(block_text):
+    """Both endpoints of a `(wire (pts (xy x1 y1) (xy x2 y2)))` block, or None."""
+    m = re.search(
+        r"\(pts\s*\(xy ([0-9.\-]+) ([0-9.\-]+)\)\s*\(xy ([0-9.\-]+) ([0-9.\-]+)\)",
+        block_text,
+    )
+    if not m:
+        return None
+    x1, y1, x2, y2 = (float(g) for g in m.groups())
+    return (x1, y1), (x2, y2)
+
+
+def _points_close(p, q, tol=_POS_TOL):
+    return _close(p[0], q[0], tol) and _close(p[1], q[1], tol)
+
+
+def _bus_graphic_intact(txt, bus_label):
+    """Tri-state check for whether `bus_label`'s vector-bus graphic is fully
+    present in `txt`:
+
+    - None   -- the aggregate tie label itself isn't present at all (bus
+      never injected on this sheet; caller should fall through to the
+      normal "not yet injected" path, same as a bare `_present()` miss).
+    - True   -- tie label present AND a `(bus (pts (xy X Y) ...))` vector
+      line starts at that same point -- genuinely, fully injected.
+    - False  -- tie label present but NO matching `(bus ...)` line exists
+      at that point -- the graphic was only *partially* destroyed.
+
+    The False case is the actual bug (wayfinder #55): kicad-sch-api's
+    `Schematic.load()`/`.save()` (used by `APISynchronizer` on every
+    incremental sync) has no parser/model support for the native KiCad
+    `bus` or `bus_entry` element types -- confirmed by a direct load+save
+    round-trip dropping both unconditionally, for either
+    `preserve_format` setting, because `load()` never captures them into
+    its own `_data` model in the first place. A round-trip through it
+    silently deletes this bus's `(bus ...)` vector-wire and every
+    `(bus_entry ...)` tap while leaving the (properly-modeled)
+    `hierarchical_label`/`label`/`wire` elements untouched. Without this
+    check, `_present()` alone reads as a false "already fully injected"
+    (the tie label survives), permanently orphaning each tap's stub wire
+    -- its bus-side endpoint no longer connects to anything, which is
+    exactly the `unconnected_wire_endpoint` ERC violation this bug
+    reports."""
+    head_pos = None
+    for start, end in _top_level_block_spans(txt):
+        block = txt[start:end]
+        m = re.match(r'\t\((?:hierarchical_label|label|global_label) "([^"]*)"', block)
+        if m and m.group(1) == bus_label:
+            head_pos = _block_at_xy(block)
+            break
+    if head_pos is None:
+        return None
+    for start, end in _top_level_block_spans(txt):
+        block = txt[start:end]
+        if re.match(r"\t\(bus\n", block):
+            pts = _block_wire_endpoints(block)
+            # `(bus ...)` reuses the same (pts (xy a b) (xy c d)) shape as a
+            # wire; its first point is the tie label's own anchor (see
+            # `_bus_block`: the label sits exactly on the bus wire's start).
+            if pts and _points_close(pts[0], head_pos):
+                return True
+    return False
+
+
+def _orphaned_head_kind(txt, bus_label):
+    """Whether `bus_label`'s (orphaned) head tie label is a
+    `hierarchical_label` (True) or plain `label`/`global_label` (False).
+
+    Needed because repairing an orphaned graphic (see
+    `_bus_graphic_intact`) cannot re-derive this from the surviving
+    per-pin real occurrences the normal first-injection path uses
+    (`leaf_hier = any(is_hier for ...)` in `inject_buses`): `_demote()`
+    already converted those from `hierarchical_label` to plain `label`
+    the first time this bus was drawn (a member's own hierarchical
+    crossing is only needed until the bus's aggregate tie absorbs it).
+    Re-deriving `leaf_hier` from those now-permanently-demoted labels on
+    a repair pass would silently flip a hierarchical bus tie to a local
+    one. The orphaned head label itself is the only remaining record of
+    the original decision, so capture it before stripping and force the
+    repair to reuse it."""
+    for start, end in _top_level_block_spans(txt):
+        block = txt[start:end]
+        m = re.match(r'\t\((hierarchical_label|label|global_label) "([^"]*)"', block)
+        if m and m.group(2) == bus_label:
+            return m.group(1) == "hierarchical_label"
+    return None
+
+
+def _strip_orphaned_bus_graphic(txt, bus_label, candidate_names):
+    """Remove `bus_label`'s orphaned graphic remnants -- the aggregate tie
+    label plus each tap's now-dangling stub wire and its end label --
+    identified structurally (a `wire` whose far endpoint coincides with a
+    `label` of a name in `candidate_names`), not by this module's own
+    emission format, so it also matches remnants that a kicad-sch-api
+    round-trip has since reformatted (see `_bus_graphic_intact`).
+
+    Only ever called once `_bus_graphic_intact` has already confirmed the
+    `(bus ...)`/`(bus_entry ...)` elements are gone; leaves every genuine
+    per-pin/component label alone. After stripping, the sheet reads as
+    "not yet injected" for this bus, so the normal detection/redraw path
+    rebuilds a complete, non-duplicated graphic from scratch."""
+    spans = _top_level_block_spans(txt)
+    blocks = [txt[s:e] for s, e in spans]
+
+    drop = set()
+    for idx, block in enumerate(blocks):
+        m = re.match(r'\t\((?:hierarchical_label|label|global_label) "([^"]*)"', block)
+        if m and m.group(1) == bus_label:
+            drop.add(idx)
+
+    if not drop:
+        return txt  # nothing to strip (shouldn't happen; caller already checked)
+
+    label_pos_to_idx = {}
+    for idx, block in enumerate(blocks):
+        m = re.match(r'\t\(label "([^"]*)"', block)
+        if m and m.group(1) in candidate_names:
+            pos = _block_at_xy(block)
+            if pos:
+                label_pos_to_idx[pos] = idx
+
+    for idx, block in enumerate(blocks):
+        if re.match(r"\t\(wire\n", block):
+            pts = _block_wire_endpoints(block)
+            if not pts:
+                continue
+            _, far_end = pts
+            for pos, lidx in label_pos_to_idx.items():
+                if _points_close(pos, far_end):
+                    drop.add(idx)
+                    drop.add(lidx)
+                    break
+
+    out = []
+    last = 0
+    for idx, (start, end) in enumerate(spans):
+        if idx in drop:
+            out.append(txt[last:start])
+            last = end
+    out.append(txt[last:])
+    return "".join(out)
+
+
 def _sheet_pin_positions(txt):
     """Map member name -> set of (x, y) positions of that name's OWN sheet-pin,
     for every ``(sheet ...)`` block in `txt`."""
@@ -196,12 +380,31 @@ def _boundary_tie_positions(sheets, this_file, members):
     return positions
 
 
-def _tie_label_positions(txt, members, sheets=None, this_file=None):
+def _tie_label_positions(txt, members, sheets=None, this_file=None, bus_label=None):
     """Map member name -> set of (float x, float y) where that member's OWN
-    tie label is expected to sit -- both kinds: a child-tie (each sheet-pin
-    position from `_sheet_pin_positions`, shifted by the known, fixed
-    rendering offset) and, when `sheets`/`this_file` are given, a
-    boundary-tie to this file's own parent (see `_boundary_tie_positions`)."""
+    tie label is expected to sit -- all three kinds: a child-tie (each
+    sheet-pin position from `_sheet_pin_positions`, shifted by the known,
+    fixed rendering offset), when `sheets`/`this_file` are given, a
+    boundary-tie to this file's own parent (see `_boundary_tie_positions`),
+    and, when `bus_label` is given, the repeat/repair-run fallback for a
+    child sheet-pin that's already collapsed to `bus_label` (see
+    `_collapsed_pin_positions`).
+
+    The `bus_label` fallback matters beyond `_parent_surgery` (which already
+    merges it in separately): any caller checking whether a stale, scattered
+    per-member tie label (leftover historical drift, or a manual edit gone
+    half-way) is a genuine tie -- not just `_parent_surgery`'s own repair --
+    needs it too, or it misreads that stale tie as a real, non-tie
+    occurrence. Found 2026-08-02 (wayfinder #55): `inject_buses`' own
+    leaf-vs-parent classification hit exactly this gap on a true root tying
+    two sibling children, where ONE child's tie label had reverted to
+    per-member form (a corrupted-history scenario) while the OTHER child's
+    tie was still correctly collapsed -- the surviving collapsed tie kept
+    `_present()` true (so the root was never treated as a fresh, first-time
+    injection), while the corrupted child's scattered labels, unrecognized
+    as ties without this fallback, were miscounted as real per-pin
+    occurrences, misclassifying the root as a leaf and drawing a bogus bus
+    graphic directly on it."""
     pin_positions = _sheet_pin_positions(txt)
     out = {}
     for name in members:
@@ -213,6 +416,10 @@ def _tie_label_positions(txt, members, sheets=None, this_file=None):
         boundary = _boundary_tie_positions(sheets, this_file, members)
         for name in members:
             out[name] |= boundary.get(name, set())
+    if bus_label is not None:
+        collapsed = _collapsed_pin_positions(txt, members, bus_label)
+        for name in members:
+            out[name] |= collapsed.get(name, set())
     return out
 
 
@@ -466,9 +673,7 @@ def _parent_surgery(txt, members, bus_label):
     AND a real FMC_D leaf itself (the STM32's own DQ pins) in the very same
     file -- a name-only rename of the first member ("FMC_D0") relabelled
     U1's own PD14 pin to the bus's vector name instead of leaving it alone."""
-    tie_label_positions = _tie_label_positions(txt, members)
-    for mem, pos in _collapsed_pin_positions(txt, members, bus_label).items():
-        tie_label_positions[mem] = tie_label_positions.get(mem, set()) | pos
+    tie_label_positions = _tie_label_positions(txt, members, bus_label=bus_label)
     first, rest = members[0], members[1:]
 
     def fix_block(m):
@@ -631,20 +836,91 @@ def inject_buses(project_dir, buses):
         # reuses whatever type its own real occurrence there already has,
         # exactly like an ordinary net label -- never a single global flag
         # for the whole bus.
-        draw_on = []
-        for n in sheets:
-            if _present(orig[n], bus.label):
-                continue  # already injected on a previous run -- idempotent no-op
-            tie_label_positions = _tie_label_positions(orig[n], members, sheets=orig, this_file=n)
+        candidate_names = set(members) | (set(alias) if aliased else set())
+
+        # Per-sheet override for `leaf_hier`, populated only when repairing
+        # an orphaned graphic (see `_bus_graphic_intact`/`_orphaned_head_kind`).
+        # The normal derivation below (`any(is_hier for ...)` over each
+        # member's *current* real occurrence) is only valid the first time a
+        # bus is drawn: `_demote()` permanently converts a hierarchical
+        # member occurrence to a plain one as part of that first drawing, so
+        # re-deriving `leaf_hier` from a member's real occurrence on a
+        # repair pass would silently read the post-demotion (plain) state
+        # and flip a hierarchical bus tie to a local one.
+        forced_hier = {}
+
+        def _leaf_status(own_text):
+            """Compute (present, real_by_index, leaf_hier) for one sheet's
+            `own_text` against the (never-mutated) `orig` dict for
+            cross-sheet tie lookups."""
+            tie_label_positions = _tie_label_positions(own_text, members, sheets=orig, this_file=n, bus_label=bus.label)
             present = []
             real_by_index = {}
             leaf_hier = False
             for i, m in enumerate(members):
-                real = _real_label_occurrences(orig[n], m, tie_label_positions)
+                real = _real_label_occurrences(own_text, m, tie_label_positions)
                 if real:
                     present.append(i)
                     real_by_index[i] = [(x, y) for x, y, _ in real]
                     leaf_hier = leaf_hier or any(is_hier for _, _, is_hier in real)
+            return present, real_by_index, leaf_hier
+
+        draw_on = []
+        for n in sheets:
+            # Determine leaf status from the CURRENT (possibly still-orphaned)
+            # text first. A parent-only / tie-only sheet (e.g. a true root
+            # that ties sibling children via coincident-point labels, never
+            # drawing its own `(bus ...)` graphic at all -- see
+            # `_parent_surgery`'s docstring) has zero real occurrences here
+            # and must never be run through the orphan check/repair below:
+            # `_present()` is True for it too (its tie labels share the bus's
+            # own name), but it never had a `(bus ...)` graphic to begin
+            # with, so `_bus_graphic_intact` would always read it as
+            # "orphaned" and incorrectly strip its legitimate tie labels.
+            #
+            # Deliberately never writes back into the shared `orig[n]` entry
+            # here (only a local `own_text` view is used for this sheet's
+            # own leaf-status recomputation after a strip): `orig` is passed
+            # as the `sheets=` cross-reference argument to
+            # `_tie_label_positions` for every OTHER sheet in this same
+            # per-bus loop too, and every sheet is processed against the
+            # same `orig` snapshot in this loop regardless of iteration
+            # order. Mutating `orig[n]` here previously leaked this sheet's
+            # strip into a *different* sheet's (e.g. a true root's)
+            # cross-reference lookup later in the very same loop,
+            # corrupting its own, unrelated tie-vs-real classification.
+            present, real_by_index, leaf_hier = _leaf_status(orig[n])
+
+            if len(present) < 2:
+                continue  # not a real leaf for this bus on this sheet
+
+            if _present(orig[n], bus.label):
+                intact = _bus_graphic_intact(orig[n], bus.label)
+                if intact:
+                    continue  # already injected on a previous run -- idempotent no-op
+                # `intact is False`: the tie label survived (e.g. a
+                # kicad-sch-api load/save round-trip during incremental
+                # sync -- see `_bus_graphic_intact`) but the `bus`/
+                # `bus_entry` graphic it anchors did not. Capture the
+                # orphaned head's own hierarchical/local type before
+                # stripping (its member occurrences are already demoted and
+                # can no longer be trusted to reconstruct it -- see above),
+                # then strip the orphaned remnants from `sheets[n]` (the
+                # actual output buffer) and recompute this sheet's own
+                # `present`/`real_by_index`/`leaf_hier` from a *local*
+                # stripped view so it's treated as not-yet-injected below
+                # and gets a complete, non-duplicated graphic redrawn --
+                # without ever touching the shared `orig` dict other
+                # sheets' own cross-references read from.
+                orphaned_hier = _orphaned_head_kind(orig[n], bus.label)
+                if orphaned_hier is not None:
+                    forced_hier[n] = orphaned_hier
+                sheets[n] = _strip_orphaned_bus_graphic(sheets[n], bus.label, candidate_names)
+                stripped_own_text = _strip_orphaned_bus_graphic(orig[n], bus.label, candidate_names)
+                present, real_by_index, leaf_hier = _leaf_status(stripped_own_text)
+
+            if n in forced_hier:
+                leaf_hier = forced_hier[n]
             if len(present) >= 2:
                 draw_on.append((n, present, leaf_hier, real_by_index))
 
