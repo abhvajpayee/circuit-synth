@@ -243,6 +243,203 @@ class Circuit:
         for sc in self._subcircuits:
             sc.finalize_references()
 
+    def _rekey_component(self, old_key: str, new_key: str, comp: "Component") -> None:
+        """Move ``comp`` from ``old_key`` to ``new_key`` in this circuit's
+        OWN ``_components`` dict (does not touch ``comp.ref`` itself --
+        callers are responsible for that). No-op if ``old_key`` isn't
+        present / doesn't hold this exact component (this component may be
+        owned by a different circuit in the tree). Used by
+        :meth:`remap_preallocated_references`.
+        """
+        if self._components.get(old_key) is comp:
+            del self._components[old_key]
+        self._components[new_key] = comp
+
+    def remap_preallocated_references(self) -> Dict[str, str]:
+        """Rename already-finalized components (across this WHOLE tree) to
+        their preallocated reference, when it differs from whatever
+        finalize_references() happened to assign via the counter.
+
+        Operates on ``self`` and its own ``_subcircuits`` recursively --
+        i.e. "the tree root" means the root of *this* Circuit's own
+        subtree, not necessarily the global root of whatever larger tree
+        ``self`` might itself be attached to (``self._parent`` is
+        deliberately never consulted here). In real usage ``self`` IS the
+        true global root (the object returned by the user's own outermost
+        ``@circuit``-decorated function, which generate_kicad_project() is
+        called on directly) -- but ``self._parent`` can legitimately be
+        non-None for reasons that have nothing to do with this circuit's
+        own hierarchy, e.g. test scaffolding that keeps one throwaway
+        "active circuit" around for the duration of a test
+        (``tests/conftest.py``'s ``mock_active_circuit`` autouse fixture
+        does exactly this) -- so asserting ``self._parent is None`` would
+        be over-tight and fail in exactly that harmless case. Reference-
+        manager operations below still correctly resolve to the *true*
+        global root regardless (``generate_next_reference``/
+        ``discard_from_tree`` both walk up via ``get_root_manager()``
+        internally), so this is safe either way.
+
+        Must be called AFTER finalize_references() has already run for the
+        entire tree (both call sites that trigger it --
+        the eager per-@circuit-call finalize in core/decorators.py, and
+        Circuit.generate_kicad_project()'s own explicit call -- already
+        assign real, final references to every component long before any
+        KiCad-aware code runs at all; see core/decorators.py's docstring
+        for why an earlier attempt at intercepting the counter *before* it
+        ran turned out to be incompatible with that eager behavior, which
+        several existing callers depend on).
+
+        This achieves the same observable outcome wayfinder issue #58
+        describes -- a component whose connectivity was matched against an
+        already-existing KiCad project's own component keeps that
+        component's old, stable reference; only genuinely-new (unmatched)
+        components ever end up holding a freshly counter-generated one --
+        via a conflict-safe two-phase rename instead: connectivity matching
+        itself never depends on what reference a component currently holds
+        (a signature is built purely from wired pins/nets), so recomputing
+        the match *after* finalize_references() already ran and then
+        renaming the result into place is exactly equivalent to
+        preallocating it beforehand, as far as the final, observable
+        reference assignment goes.
+
+        Phase 1 moves every component that needs ANY reference change (both
+        the matched components moving to their target, and any OTHER,
+        unrelated component that happened to already be counter-assigned
+        one of those target references) to a temporary, guaranteed-unused
+        reference, so no two components ever transiently collide. Phase 2
+        then assigns final references: matched components claim their real
+        target; displaced components get a genuinely fresh one from the
+        counter (which correctly skips every now-claimed target and every
+        other already-registered reference).
+
+        Returns a ``{old_ref: new_ref}`` dict of every rename actually
+        performed (both matched-component renames and displaced-component
+        renames), for logging/verification by the caller.
+        """
+        from .reference_preallocation import ref_prefix
+
+        all_pairs = list(self._iter_all_components_with_circuit())
+
+        to_rename = [
+            (circ, comp)
+            for circ, comp in all_pairs
+            if comp._preallocated_ref and comp.ref != comp._preallocated_ref
+        ]
+        if not to_rename:
+            return {}
+
+        target_refs = {comp._preallocated_ref for _, comp in to_rename}
+        matched_ids = {id(comp) for _, comp in to_rename}
+
+        displaced = [
+            (circ, comp)
+            for circ, comp in all_pairs
+            if id(comp) not in matched_ids and comp.ref in target_refs
+        ]
+
+        renames: Dict[str, str] = {}
+
+        # Phase 1: move every changing component to a temporary reference.
+        original_refs: Dict[int, str] = {}
+        for i, (circ, comp) in enumerate(to_rename + displaced):
+            old_ref = comp.ref
+            original_refs[id(comp)] = old_ref
+            temp_ref = f"__PREALLOC_TMP__{i}"
+            circ._reference_manager.discard_from_tree(old_ref)
+            circ._rekey_component(old_ref, temp_ref, comp)
+            comp.ref = temp_ref
+            circ._reference_manager.register_reference(temp_ref)
+
+        # Phase 2a: matched components claim their real target reference.
+        for circ, comp in to_rename:
+            temp_ref = comp.ref
+            target = comp._preallocated_ref
+            circ._reference_manager.discard_from_tree(temp_ref)
+            circ._rekey_component(temp_ref, target, comp)
+            comp.ref = target
+            circ._reference_manager.register_reference(target)
+            renames[original_refs[id(comp)]] = target
+
+        # Phase 2b: displaced components get a genuinely fresh reference.
+        for circ, comp in displaced:
+            temp_ref = comp.ref
+            prefix = ref_prefix(original_refs[id(comp)])
+            circ._reference_manager.discard_from_tree(temp_ref)
+            final_ref = circ._reference_manager.generate_next_reference(prefix)
+            circ._rekey_component(temp_ref, final_ref, comp)
+            comp.ref = final_ref
+            renames[original_refs[id(comp)]] = final_ref
+
+        context_logger.info(
+            "Remapped preallocated references after connectivity match",
+            component="CIRCUIT",
+            circuit_name=self.name,
+            renamed=len(renames),
+            matched=len(to_rename),
+            displaced=len(displaced),
+        )
+        return renames
+
+    def _iter_all_components_with_circuit(self):
+        """Yield (circuit, component) for every component in this circuit
+        and all its subcircuits, recursively, in Python declaration order
+        (the order Component(...) objects were constructed) -- used by
+        preallocation matching, where new-side declaration order is one
+        half of the duplicate-connectivity tiebreak (see
+        core/reference_preallocation.py)."""
+        for comp in self._component_list:
+            yield self, comp
+        for sc in self._subcircuits:
+            yield from sc._iter_all_components_with_circuit()
+
+    def collect_preallocation_records(self):
+        """Build per-sheet connectivity records and a whole-tree net map for
+        this (not-yet-finalized) circuit tree, for matching against an
+        existing KiCad project's own components -- see
+        core/reference_preallocation.py and
+        kicad.schematic.reference_preallocator (the KiCad-I/O adapter that
+        actually calls this and drives the match). Pure in-memory, no KiCad
+        file I/O.
+
+        Returns:
+            (per_sheet, global_net_map, components_by_id): ``per_sheet`` maps
+            this circuit's (and every subcircuit's) ``.name`` to a list of
+            ``ComponentRecord`` in declaration order, one entry per
+            component *in that circuit directly* (not recursively).
+            ``global_net_map`` is the whole-tree net-name -> [PinRecord]
+            map (needed since a net can cross sheet boundaries -- e.g. a
+            shared GND -- so auto-named-net peer resolution can't be
+            scoped to just one sheet). Every component (placeholder or
+            already-final) is included in both, since already-final
+            components can still be meaningful net peers even though they
+            themselves are never matching candidates. ``components_by_id``
+            maps each record's ``identity`` (``id(comp)`` -- ``Component``
+            is a dataclass with a generated ``__eq__`` and is therefore
+            unhashable, so the object itself can't be used directly as a
+            dict key/matching identity) back to the actual ``Component``,
+            so a caller can apply match results (``comp._preallocated_ref
+            = matched_kicad_ref``) after matching.
+        """
+        from .reference_preallocation import ComponentRecord, build_global_net_map, ref_prefix
+
+        per_sheet: Dict[str, List] = {}
+        all_records: List = []
+        components_by_id: Dict[int, "Component"] = {}
+        for circ, comp in self._iter_all_components_with_circuit():
+            prefix = comp._user_reference if comp._is_prefix else ref_prefix(comp.ref or "")
+            pins = {
+                str(pin_num): (pin.net.name if pin.net is not None else None)
+                for pin_num, pin in comp._pins.items()
+            }
+            identity = id(comp)
+            components_by_id[identity] = comp
+            rec = ComponentRecord(identity=identity, prefix=prefix, value=comp.value, pins=pins)
+            per_sheet.setdefault(circ.name, []).append(rec)
+            all_records.append(rec)
+
+        global_net_map = build_global_net_map(all_records)
+        return per_sheet, global_net_map, components_by_id
+
     def _get_source_file(self) -> Optional[Path]:
         """Get the source file path for this circuit's function.
 
@@ -763,6 +960,46 @@ class Circuit:
                     f"No existing project found, using circuit name: {project_base_name}",
                     component="CIRCUIT",
                 )
+
+            # Reference preallocation (wayfinder #58): when an existing
+            # KiCad project is already present and this isn't a forced
+            # clean regen, connectivity-match this (already-finalized --
+            # see finalize_references() above) circuit tree against that
+            # project's own components, and rename any match back to its
+            # old, stable reference -- BEFORE the JSON netlist (what the
+            # KiCad sync layer actually consumes) is generated. This is
+            # what prevents a new component added to one sheet from
+            # cascading a reference-renumbering (and, worse, a silent
+            # delete+recreate) across unrelated sheets during incremental
+            # sync -- see core/reference_preallocation.py and
+            # docs/research/kicad-incremental-sync-identity-stability.md.
+            # First/clean generation (no existing project, or
+            # force_regenerate=True) is unaffected: nothing to preallocate
+            # against, so this is a no-op.
+            if len(existing_projects) == 1 and not force_regenerate:
+                try:
+                    from ..kicad.schematic.reference_preallocator import (
+                        preallocate_from_existing_project,
+                    )
+
+                    renamed = preallocate_from_existing_project(
+                        self, str(existing_projects[0])
+                    )
+                    if renamed:
+                        context_logger.info(
+                            "Reference preallocation renamed components to match "
+                            "existing project",
+                            component="CIRCUIT",
+                            renamed=renamed,
+                        )
+                except Exception:
+                    context_logger.warning(
+                        "Reference preallocation against existing project failed -- "
+                        "continuing with the counter-assigned references from "
+                        "finalize_references() instead",
+                        component="CIRCUIT",
+                        exc_info=True,
+                    )
 
             # Create JSON netlist in project directory (canonical format)
             json_path = output_path / f"{project_base_name}.json"

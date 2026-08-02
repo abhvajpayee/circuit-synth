@@ -61,6 +61,29 @@ class Component(SimplifiedPinAccess):
     _is_prefix: bool = field(default=False, init=False, repr=False)
     _user_reference: str = field(default="", init=False, repr=False)
 
+    # Set by circuit_synth.kicad.schematic.reference_preallocator (or
+    # directly by a test) BEFORE Circuit.finalize_references() runs, when
+    # this component's connectivity was matched against an already-existing
+    # KiCad project's own component -- see core/reference_preallocation.py
+    # for the matching algorithm and wayfinder issue #58 for the full
+    # design rationale. When set, finalize_references() uses this value
+    # directly instead of consuming the next counter value for this
+    # component's prefix.
+    _preallocated_ref: Optional[str] = field(default=None, init=False, repr=False)
+
+    # Belt-and-suspenders identity fields (wayfinder #58): populated from
+    # the same preallocation match as _preallocated_ref, when available, so
+    # that kicad.schematic.sync_strategies.UUIDMatchStrategy /
+    # PositionRenameStrategy stop being unconditionally-dead-code for this
+    # project's hand-authored-Python-source usage pattern (previously,
+    # core.Component never carried a uuid/position at all -- see
+    # docs/research/kicad-incremental-sync-identity-stability.md #4d).
+    # Neither field is required for the core preallocation mechanism
+    # itself (which matches on connectivity, not identity) -- they are an
+    # additional, independent matching signal for the *sync* layer.
+    uuid: Optional[str] = field(default=None, init=False, repr=False)
+    position: Optional[Any] = field(default=None, init=False, repr=False)
+
     ALLOWED_REASSIGN = {"value"}
 
     def __init__(
@@ -101,6 +124,9 @@ class Component(SimplifiedPinAccess):
         self._extra_fields = {}
         self._pins = {}
         self._pin_names = {}
+        self._preallocated_ref = None
+        self.uuid = None
+        self.position = None
         self._is_prefix = False
         self._user_reference = ""
 

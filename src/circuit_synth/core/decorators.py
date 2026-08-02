@@ -41,6 +41,27 @@ def circuit(_func=None, *, name=None, comments=True):
     If there's an existing current circuit (the "parent"), the new circuit is
     attached to the parent as a subcircuit. Then references are finalized
     before returning the child circuit.
+
+    NOTE on wayfinder #58 (incremental-sync reference preallocation): an
+    earlier version of this fix tried to defer this eager, per-decorated-
+    function finalize_references() call so that Circuit.generate_kicad_project()
+    could preallocate connectivity-matched references BEFORE any
+    counter-based assignment happened anywhere in the tree. That turned out
+    to be incompatible with existing, load-bearing usage: many callers
+    (including several tests) construct a circuit via a decorated function
+    and inspect real, finalized `.ref` values immediately, without ever
+    calling generate_kicad_project(). Since a nested @circuit call's own
+    wrapper finalizes its circuit's references as soon as that call
+    returns -- long before the outermost @circuit function itself returns
+    -- there is no way to defer this eagerness generally without breaking
+    that pattern. The eager call is therefore kept exactly as before;
+    Circuit.remap_preallocated_references() (core/circuit.py) instead
+    performs a conflict-safe *rename* pass after the fact, achieving the
+    same observable outcome (matched components end up holding their old,
+    stable reference; only genuinely new components keep a freshly
+    counter-generated one) without requiring this call to move. See that
+    method's docstring, and core/reference_preallocation.py, for the full
+    design.
     """
 
     def _decorator(func):

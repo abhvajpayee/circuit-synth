@@ -59,6 +59,33 @@ class ReferenceManager:
             "Registered reference", component="REFERENCE_MANAGER", reference=ref
         )
 
+    def discard_from_tree(self, ref: str) -> None:
+        """Remove ``ref`` from this reference's registration, wherever in
+        the tree it actually lives.
+
+        register_reference() stores a reference on whichever manager
+        instance ``register_reference`` was *called on* (it does not
+        redirect to root the way generate_next_reference() does) -- a
+        user-supplied final reference is registered on its owning
+        circuit's own manager (Circuit.add_component()), while a
+        counter-generated reference ends up registered on the root
+        manager (generate_next_reference() always redirects there). A
+        caller that only knows a reference string (not which manager
+        instance originally registered it) can't safely call
+        ``_used_references.discard()`` on just one node -- so this walks
+        the whole tree from the root and discards it everywhere it might
+        be. Used by Circuit.remap_preallocated_references() (wayfinder
+        #58) to free up a reference before reassigning it elsewhere.
+        """
+        root = self.get_root_manager()
+
+        def _walk(manager: "ReferenceManager") -> None:
+            manager._used_references.discard(ref)
+            for child in manager._children:
+                _walk(child)
+
+        _walk(root)
+
     def set_initial_counters(self, counters: Dict[str, int]) -> None:
         """Set initial counters for reference generation."""
         for prefix, start_num in counters.items():
