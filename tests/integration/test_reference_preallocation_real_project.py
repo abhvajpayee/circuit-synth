@@ -313,3 +313,172 @@ def test_aliased_bus_unique_connectivity_matcher_gap(tmp_path):
             f"component {old_ref} kept its UUID but was renumbered to "
             f"{after_by_uuid[old_uuid]} -- preallocation matched it to the wrong reference"
         )
+
+
+def _bank_sheet_snapshot(project_dir):
+    """Extract the existing-side connectivity signatures for the Banks sheet,
+    exactly as the preallocation matcher itself sees them."""
+    from circuit_synth.kicad.schematic.reference_preallocator import (
+        build_existing_project_snapshot,
+    )
+
+    pro_files = sorted(project_dir.glob("*.kicad_pro"))
+    assert pro_files, f"no .kicad_pro generated under {project_dir}"
+    per_sheet, _global_map = build_existing_project_snapshot(str(pro_files[0]))
+    return {r.identity: r.pins for r in per_sheet["Banks"]}
+
+
+def _build_bank_project(project_dir, extra_early_component: bool):
+    """Generate a project whose 'Banks' sheet holds a resistor_bank pull-up
+    array and a cap_bank decoupling array -- the two circuit-synth renderers
+    that express a member pin's connectivity as a shared RAIL WIRE rather
+    than a per-pin label/power symbol."""
+    from circuit_synth import cap_bank, resistor_bank
+
+    _start_fresh_top_level_build()
+
+    @circuit(name="Early")
+    def early():
+        gnd = Net("GND")
+        vcc = Net("VCC")
+        if extra_early_component:
+            sig_new = Net("SIG_NEW")
+            r_new = Component(symbol="Device:R", ref="R", value="1k")
+            r_new[1] += sig_new
+            r_new[2] += gnd
+        r = Component(symbol="Device:R", ref="R", value="10k")
+        r[1] += vcc
+        r[2] += gnd
+
+    @circuit(name="Banks")
+    def banks():
+        v3v3 = Net("+3V3")
+        gnd = Net("GND")
+        pus = []
+        for signal in ("SD_CMD", "SD_D0", "SD_D1"):
+            r = Component(symbol="Device:R", ref="R", value="47k")
+            r[1] += v3v3
+            r[2] += Net(signal)
+            pus.append(r)
+        resistor_bank(pus, "SD_PU", common=v3v3)
+
+        caps = []
+        for _ in range(4):
+            c = Component(symbol="Device:C", ref="C", value="100n")
+            c[1] += v3v3
+            c[2] += gnd
+            caps.append(c)
+        cap_bank(caps, "DEC3V3")
+
+    @circuit(name="root")
+    def root():
+        early()
+        banks()
+
+    c = root()
+    result = c.generate_kicad_project(
+        str(project_dir), generate_pcb=False, force_regenerate=False, update_source_refs=False
+    )
+    assert result["success"]
+    return result
+
+
+def test_rail_wired_bank_pin_connectivity_is_extracted(tmp_path):
+    """wayfinder #61: a pin whose connectivity is expressed as a shared RAIL
+    WIRE (``cap_bank()`` / ``resistor_bank()``) must still contribute its net
+    to the component's preallocation connectivity signature.
+
+    Root cause this pins down: ``APISynchronizer._get_pin_labels()`` only
+    ever looks for a regular label, hierarchical label, or power symbol
+    sitting within ``PIN_LABEL_DISTANCE_TOLERANCE`` (0.5 mm) of the pin's own
+    computed position. But circuit-synth's own ``schematic_writer``
+    deliberately does NOT write a per-pin marker for bank member pins: it
+    adds them to ``_cap_bank_suppress`` / ``_resistor_bank_suppress``, and
+    instead wires them with a shared rail wire carrying exactly ONE net
+    marker at the rail's *extended* far end (``_add_rail_marker()`` at
+    ``x_lo - ext``, where ``ext >= 2.54 mm``) plus a junction at each member
+    pin. Every bank member pin is therefore an arbitrary, bank-size-
+    proportional distance from the only marker naming its net -- far outside
+    any fixed tolerance -- so the extraction returns nothing for it.
+
+    Consequences, both reproduced below:
+      * a ``resistor_bank()`` pull-up loses its COMMON (power-rail) pin, so
+        its signature is partial -- the ``SD_CMD``-pull-up-to-``+3V3``
+        symptom originally reported on the ticket;
+      * a ``cap_bank()`` decoupling cap has BOTH pins rail-wired, so its
+        signature is entirely EMPTY -- strictly worse than the ticket
+        assumed, and the real reason a handful of decoupling caps churn.
+
+    This is deliberately NOT fixed by widening the distance tolerance: the
+    marker's distance grows with the bank, and a tolerance large enough to
+    reach it would falsely bind unrelated neighbouring markers. The pin is
+    connected through the rail's wire graph, so the wire graph is what has
+    to be traversed.
+    """
+    project_dir = tmp_path / "proj"
+    _build_bank_project(project_dir, extra_early_component=False)
+
+    pins_by_ref = _bank_sheet_snapshot(project_dir)
+    resistors = {ref: pins for ref, pins in pins_by_ref.items() if ref.startswith("R")}
+    caps = {ref: pins for ref, pins in pins_by_ref.items() if ref.startswith("C")}
+    assert len(resistors) == 3, f"expected the 3 bank pull-ups, got {sorted(resistors)}"
+    assert len(caps) == 4, f"expected the 4 bank caps, got {sorted(caps)}"
+
+    # Each resistor_bank pull-up must carry BOTH its fan-out signal pin and
+    # its rail-wired common pin on +3V3.
+    for ref, pins in sorted(resistors.items()):
+        assert "+3V3" in pins.values(), (
+            f"pull-up {ref} lost its rail-wired +3V3 common pin: pins={pins} -- "
+            "resistor_bank() suppresses the per-pin marker and names the net only "
+            "at the rail's far end, which the pin-position search cannot see"
+        )
+        assert len(pins) == 2, f"pull-up {ref} should have 2 connected pins, got {pins}"
+
+    # Each cap_bank cap has BOTH pins rail-wired, so both must resolve.
+    for ref, pins in sorted(caps.items()):
+        assert set(pins.values()) == {"+3V3", "GND"}, (
+            f"decoupling cap {ref} lost its rail-wired pins: pins={pins} -- both of a "
+            "cap_bank member's pins are drawn by shared rails, leaving its "
+            "connectivity signature empty and its identity unmatchable on resync"
+        )
+
+
+def test_rail_wired_bank_members_keep_identity_on_resync(tmp_path):
+    """wayfinder #61, end-to-end consequence: because rail-wired bank members
+    have empty/partial connectivity signatures, they fail to preallocation-
+    match on an incremental resync and get removed + recreated with fresh
+    UUIDs -- the observed ``C4``/``C5``/``C6``/``C36``/``C40`` churn on the
+    real acquisition_mcu board.
+
+    A component inserted into the earlier-traversed "Early" sheet shifts the
+    global per-prefix counter underneath the untouched "Banks" sheet (the
+    classic #55/#58 cascade trigger). Every bank member must keep both its
+    reference and its UUID.
+    """
+    project_dir = tmp_path / "proj"
+    _build_bank_project(project_dir, extra_early_component=False)
+
+    sch_before = ksa.Schematic.load(str(project_dir / "Banks.kicad_sch"))
+    before_by_uuid = {
+        c.uuid: c.reference for c in sch_before.components if not c.reference.startswith("#")
+    }
+    assert len(before_by_uuid) == 7, "expected 3 bank pull-ups + 4 bank caps on Banks"
+
+    _build_bank_project(project_dir, extra_early_component=True)
+
+    sch_after = ksa.Schematic.load(str(project_dir / "Banks.kicad_sch"))
+    after_by_uuid = {
+        c.uuid: c.reference for c in sch_after.components if not c.reference.startswith("#")
+    }
+    assert len(after_by_uuid) == 7, "Banks' own components must not multiply or vanish"
+
+    for old_uuid, old_ref in sorted(before_by_uuid.items(), key=lambda kv: kv[1]):
+        assert old_uuid in after_by_uuid, (
+            f"bank member {old_ref} (uuid {old_uuid}) was removed and recreated on "
+            "resync -- its rail-wired connectivity was invisible to the "
+            "preallocation matcher (wayfinder #61)"
+        )
+        assert after_by_uuid[old_uuid] == old_ref, (
+            f"bank member {old_ref} kept its UUID but was renumbered to "
+            f"{after_by_uuid[old_uuid]}"
+        )

@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # Constants
 POWER_SYMBOL_PREFIX = "#PWR"
 PIN_LABEL_DISTANCE_TOLERANCE = 0.5  # mm - distance threshold for associating labels/symbols with pins
+# mm - point-on-wire tolerance for rail (wire-graph) connectivity resolution.
+# Deliberately much tighter than PIN_LABEL_DISTANCE_TOLERANCE: this is an exact
+# geometric incidence test ("is this point ON this wire"), not a proximity
+# search, and rail endpoints/junctions are emitted from the same computed pin
+# coordinates they must match.
+WIRE_GEOMETRY_TOLERANCE = 0.01
 
 
 def _patch_kicad_sch_api_reference_validation() -> None:
@@ -628,7 +634,195 @@ class APISynchronizer:
                             pin_labels[str(pin.number)] = (PowerSymbolLabel(component), "power_symbol")
                             break
 
+            # Last resort: the pin may carry no marker of its own at all, and
+            # instead be wired into a shared RAIL. Resolve it through the wire
+            # graph (wayfinder #61) -- see _find_marker_via_wires().
+            if str(pin.number) not in pin_labels:
+                rail_match = self._find_marker_via_wires(pin_pos)
+                if rail_match is not None:
+                    pin_labels[str(pin.number)] = rail_match
+
         return pin_labels
+
+    # ------------------------------------------------------------------
+    # Rail (wire-graph) connectivity resolution -- wayfinder #61
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _point_on_segment(
+        px: float, py: float, ax: float, ay: float, bx: float, by: float,
+        tolerance: float = WIRE_GEOMETRY_TOLERANCE,
+    ) -> bool:
+        """Whether point (px, py) lies on the segment (ax, ay)-(bx, by).
+
+        Used instead of a plain endpoint comparison because a rail-wired pin
+        deliberately lands in the MIDDLE of its rail (with a junction on it),
+        not at either end.
+        """
+        vx, vy = bx - ax, by - ay
+        seg_len_sq = vx * vx + vy * vy
+        if seg_len_sq <= tolerance * tolerance:
+            # Degenerate (zero-length) wire: treat as a bare point.
+            return math.hypot(px - ax, py - ay) <= tolerance
+        # Projection parameter of the point onto the segment, clamped to it.
+        t = ((px - ax) * vx + (py - ay) * vy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        return math.hypot(px - (ax + t * vx), py - (ay + t * vy)) <= tolerance
+
+    def _wire_segments(self) -> List[Tuple[float, float, float, float]]:
+        """All wire segments on this sheet as (x1, y1, x2, y2) tuples.
+
+        Cached per synchronizer: _get_pin_labels() is called once per
+        component, and every call would otherwise re-walk every wire. The
+        cache is keyed on the wire count so it self-invalidates if wires are
+        added or removed (e.g. by _load_sheets_recursively) between calls.
+        """
+        try:
+            wires = list(self.schematic.wires)
+        except Exception:
+            logger.debug("Schematic exposes no iterable wires; skipping rail resolution")
+            wires = []
+
+        cached = getattr(self, "_wire_segment_cache", None)
+        if cached is not None and cached[0] == len(wires):
+            return cached[1]
+
+        segments: List[Tuple[float, float, float, float]] = []
+
+        for wire in wires:
+            points = getattr(wire, "points", None) or []
+            coords = []
+            for point in points:
+                x = getattr(point, "x", None)
+                y = getattr(point, "y", None)
+                if x is None and isinstance(point, dict):
+                    x, y = point.get("x"), point.get("y")
+                if x is None or y is None:
+                    continue
+                coords.append((float(x), float(y)))
+            # A wire is a polyline: emit each consecutive pair as a segment.
+            for (x1, y1), (x2, y2) in zip(coords, coords[1:]):
+                segments.append((x1, y1, x2, y2))
+
+        self._wire_segment_cache = (len(wires), segments)
+        return segments
+
+    def _connected_wire_group(
+        self, pin_pos: Point
+    ) -> List[Tuple[float, float, float, float]]:
+        """The transitively-connected set of wire segments touching pin_pos.
+
+        Two segments are connected when any endpoint of one lies on the other
+        (which covers both shared endpoints and mid-span T-taps). Returns an
+        empty list when the pin sits on no wire at all.
+        """
+        segments = self._wire_segments()
+        seeds = [
+            index
+            for index, (x1, y1, x2, y2) in enumerate(segments)
+            if self._point_on_segment(pin_pos.x, pin_pos.y, x1, y1, x2, y2)
+        ]
+        if not seeds:
+            return []
+
+        visited = set(seeds)
+        frontier = list(seeds)
+        while frontier:
+            current = frontier.pop()
+            cx1, cy1, cx2, cy2 = segments[current]
+            for index, (x1, y1, x2, y2) in enumerate(segments):
+                if index in visited:
+                    continue
+                touching = (
+                    self._point_on_segment(x1, y1, cx1, cy1, cx2, cy2)
+                    or self._point_on_segment(x2, y2, cx1, cy1, cx2, cy2)
+                    or self._point_on_segment(cx1, cy1, x1, y1, x2, y2)
+                    or self._point_on_segment(cx2, cy2, x1, y1, x2, y2)
+                )
+                if touching:
+                    visited.add(index)
+                    frontier.append(index)
+
+        return [segments[index] for index in sorted(visited)]
+
+    def _find_marker_via_wires(self, pin_pos: Point) -> Optional[tuple]:
+        """Resolve a pin's net via the rail/wire graph it sits on.
+
+        ``_get_pin_labels()``'s primary lookup only sees connectivity written
+        as a marker (regular label, hierarchical label, or power symbol)
+        sitting essentially ON the pin. That is how circuit-synth writes MOST
+        pins -- but deliberately not all of them: ``schematic_writer``'s
+        ``cap_bank()`` / ``resistor_bank()`` renderers suppress the per-pin
+        marker for bank member pins (``_cap_bank_suppress`` /
+        ``_resistor_bank_suppress``) and instead wire them with a shared rail
+        carrying exactly ONE marker, placed at the rail's *extended* far end
+        (``_add_rail_marker()`` at ``x_lo - ext``, ``ext >= 2.54 mm``), with a
+        junction at each member pin. The distance from a member pin to that
+        marker grows with the bank, so no fixed distance tolerance can reach
+        it -- and widening ``PIN_LABEL_DISTANCE_TOLERANCE`` enough to try
+        would falsely bind unrelated neighbouring markers instead. The pin is
+        connected through the rail's wires, so the wires are what must be
+        traversed.
+
+        Walks the connected wire group under ``pin_pos`` and returns the
+        marker lying on it, in the same ``(label_like, label_type)`` shape the
+        primary lookup returns. When several markers sit on one wire group
+        they all name the same KiCad net; the nearest to the pin is returned
+        so the result is deterministic.
+
+        Returns ``None`` when the pin is on no wire, or on a wire group that
+        carries no marker (an unnamed net -- correctly contributing nothing
+        to a connectivity signature).
+        """
+        group = self._connected_wire_group(pin_pos)
+        if not group:
+            return None
+
+        def _on_group(x: float, y: float) -> bool:
+            return any(
+                self._point_on_segment(x, y, x1, y1, x2, y2) for x1, y1, x2, y2 in group
+            )
+
+        candidates: List[Tuple[float, Any, str]] = []
+
+        for label in self.schematic.labels:
+            if _on_group(label.position.x, label.position.y):
+                distance = math.hypot(
+                    label.position.x - pin_pos.x, label.position.y - pin_pos.y
+                )
+                candidates.append((distance, label, "regular"))
+
+        for label in self.schematic.hierarchical_labels:
+            if _on_group(label.position.x, label.position.y):
+                distance = math.hypot(
+                    label.position.x - pin_pos.x, label.position.y - pin_pos.y
+                )
+                candidates.append((distance, label, "hierarchical"))
+
+        for component in self.schematic.components:
+            if not component.reference.startswith(POWER_SYMBOL_PREFIX):
+                continue
+            if _on_group(component.position.x, component.position.y):
+                distance = math.hypot(
+                    component.position.x - pin_pos.x, component.position.y - pin_pos.y
+                )
+                candidates.append((distance, PowerSymbolLabel(component), "power_symbol"))
+
+        if not candidates:
+            return None
+
+        # Order by distance, then by marker text, so ties resolve identically
+        # on every run (signatures must be reproducible across syncs).
+        candidates.sort(key=lambda item: (item[0], getattr(item[1], "text", "") or ""))
+        _distance, marker, marker_type = candidates[0]
+        logger.debug(
+            "Resolved pin at (%.2f, %.2f) to net '%s' via rail wire graph (%d segment(s))",
+            pin_pos.x,
+            pin_pos.y,
+            getattr(marker, "text", None),
+            len(group),
+        )
+        return (marker, marker_type)
 
     def _get_net_object(self, net_name: str):
         """
