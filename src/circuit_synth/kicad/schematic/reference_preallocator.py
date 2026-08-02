@@ -27,26 +27,29 @@ different jobs that could all loosely be called "connectivity extraction":
    ``HierarchicalSynchronizer`` and reading its ``root_sheet`` tree) --
    there's nothing sheet-discovery-specific about *this* ticket's job, so
    there's no reason to reimplement it.
-2. Per-pin label lookup (``APISynchronizer._get_pin_labels()``,
-   ``synchronizer.py:559``) -- computes each pin's real absolute position
-   from the symbol library's own geometry (rotation/mirror-aware) and
-   matches it, within a distance tolerance, against the schematic's actual
-   regular labels, hierarchical labels, and power symbols. This IS reused
-   directly here (``_existing_records_for_sheet()`` below), because it's
-   the one existing primitive that's actually pin-accurate for how
-   circuit-synth writes connectivity to disk (labels/power-symbols at
-   computed pin positions, not classic wire-traced net objects).
-   Originally this adapter instead tried ``kicad_sch_api.Schematic``'s own
-   ``get_net_for_pin()``/``list_component_pins()`` -- a superficially
-   simpler, more direct-looking primitive -- but that turned out (verified
-   empirically in a disposable sandbox project, against both a
-   freshly-generated and a freshly-synced schematic) to always return an
-   unresolved/empty net for every single pin: kicad_sch_api's
-   ``NetCollection`` is a plain, manually-populated container, never
-   auto-computed from a loaded file's actual wires/labels/power-symbols on
-   ``Schematic.load()``. Left as a documented dead end here rather than a
-   silent swap, since it's a natural thing for a future session to retry
-   without this context.
+2. Per-pin connectivity extraction -- as of wayfinder #63 this comes from
+   KiCad's own exported netlist (``netlist_connectivity.py``), which states
+   ``net -> [(ref, pin), ...]`` directly with no geometry, tolerance or
+   special cases. ``APISynchronizer._get_pin_labels()``'s geometric
+   proximity search (``synchronizer.py:565``) is retained as an automatic
+   per-component fallback for when ``kicad-cli`` is unavailable or the
+   export fails -- see ``_existing_records_for_sheet()`` below for the
+   rationale and the measured equivalence of the two sources.
+
+   Two dead ends worth not re-walking:
+
+   - ``kicad_sch_api.Schematic``'s own ``get_net_for_pin()``/
+     ``list_component_pins()`` looks like the natural direct primitive, but
+     always returns an unresolved/empty net for every pin (verified
+     empirically against both a freshly-generated and a freshly-synced
+     schematic): kicad_sch_api's ``NetCollection`` is a plain, manually-
+     populated container, never auto-computed from a loaded file's wires/
+     labels/power-symbols on ``Schematic.load()``.
+   - circuit-synth's own ``NetlistExporter`` also emits a ``.net`` file, but
+     flattens every component's sheetpath to ``"/"``. Only ``kicad-cli``'s
+     export preserves the real nested hierarchy, so ``netlist_connectivity``
+     always exports fresh via ``kicad-cli`` rather than reading whatever
+     ``.net`` happens to be sitting in the project directory.
 3. Fuzzy, confidence-scored net-topology matching (``ConnectionTracer``,
    ``NetMatcher``, ``ConnectionMatchStrategy``) -- a *component-position*-
    granularity (not per-pin!) trace used only by the existing sync
@@ -74,6 +77,7 @@ from ...core.reference_preallocation import (
     ref_prefix,
 )
 from .hierarchical_synchronizer import HierarchicalSheet, HierarchicalSynchronizer
+from .netlist_connectivity import load_project_connectivity
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +103,37 @@ def _build_alias_map(top_circuit) -> Dict[str, str]:
 
 
 def _existing_records_for_sheet(
-    synchronizer, alias_map: Optional[Dict[str, str]] = None
+    synchronizer,
+    alias_map: Optional[Dict[str, str]] = None,
+    netlist_connectivity: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
 ) -> List[ComponentRecord]:
     """Build ComponentRecords for every real (non-power-symbol) component
     directly on one loaded sheet.
 
+    Connectivity source (wayfinder #63)
+    ------------------------------------
+    ``netlist_connectivity`` (``{ref: {pin: net_name}}``, from
+    ``netlist_connectivity.load_project_connectivity()``) is the preferred
+    source: it is KiCad's own resolved connectivity, exported via
+    ``kicad-cli``, with no geometry involved. When a component's reference is
+    present there, its pins are taken from it verbatim.
+
+    When it is absent -- kicad-cli unavailable, export failed, or this
+    particular component missing from the netlist -- the record falls back
+    per-component to the geometric ``_get_pin_labels()`` path described
+    below, so preallocation degrades to its previous behavior rather than
+    failing outright. Losing preallocation entirely would renumber
+    references and break PCB footprint anchors, which is precisely the
+    outcome wayfinder #58 exists to prevent, so the fallback is deliberate
+    and must not be removed.
+
+    Measured equivalence (real ``acquisition_mcu`` project, 947
+    pin-connections): the netlist source and the fully-patched geometric
+    source agree on every single pin-connection, so this is a
+    behavior-preserving swap of the data source, not a semantic change.
+
+    Geometric fallback -- ``APISynchronizer._get_pin_labels()``
+    ------------------------------------------------------------
     Uses ``APISynchronizer._get_pin_labels()`` -- the same, already-existing
     per-pin connectivity extraction the fuzzy sync strategies are built on
     (``synchronizer.py:559``) -- rather than ``kicad_sch_api``'s own
@@ -125,8 +155,19 @@ def _existing_records_for_sheet(
     correct existing machinery to reuse here, not the superficially
     simpler kicad_sch_api net API.
 
-    Alias normalization (wayfinder #59)
-    ------------------------------------
+    Alias normalization (wayfinder #59) -- fallback path only
+    ----------------------------------------------------------
+    ``alias_map`` applies only to the geometric fallback. A netlist reports
+    an aliased bus member by its CANONICAL positional name (``ETH_9``), not
+    the elaborated alias (``ETH_NRST``) that ``bus_emit.py`` retexts onto the
+    on-schematic label -- KiCad resolves the bus member itself, and is
+    unaffected by that cosmetic rewrite. So netlist-sourced pins already
+    speak the same vocabulary as the Python side and need no translation
+    (applying ``alias_map`` to them is a harmless no-op, since alias-form
+    names never appear there). Confirmed empirically on the real project:
+    all 140 pins where the two sources differ are exactly the aliased-bus
+    pins, with the netlist canonical and the label text aliased.
+
     ``_get_pin_labels()`` returns whatever label text is actually sitting at
     a pin's position, verbatim. For a pin wired to an *aliased* Bus member
     (``Bus(name, members=[...])``), that text is **not** the bus member's
@@ -159,16 +200,33 @@ def _existing_records_for_sheet(
     records = []
     schematic = synchronizer.schematic
     alias_map = alias_map or {}
+    netlist_connectivity = netlist_connectivity or {}
     for comp in schematic.components:
         ref = getattr(comp, "reference", None)
         if not ref or ref.startswith("#"):
             continue  # power symbols (#PWR*) and sheet-internal flags aren't matching candidates
         prefix = ref_prefix(ref)
-        pin_labels = synchronizer._get_pin_labels(comp)  # {pin_num: (Label, label_type)}
-        pins: Dict[str, Optional[str]] = {
-            pin_num: (alias_map.get(label.text, label.text) if label.text else None)
-            for pin_num, (label, _label_type) in pin_labels.items()
-        }
+
+        pins: Dict[str, Optional[str]] = {}
+        netlist_pins = netlist_connectivity.get(ref)
+        if netlist_pins is not None:
+            # Preferred: KiCad's own resolved connectivity. Already canonical
+            # and already normalized to bare net names, so alias_map is not
+            # applied here (see the "Alias normalization" note above).
+            pins = dict(netlist_pins)
+        else:
+            if netlist_connectivity:
+                logger.debug(
+                    "Component %s absent from netlist connectivity; "
+                    "falling back to geometric pin-label extraction",
+                    ref,
+                )
+            pin_labels = synchronizer._get_pin_labels(comp)  # {pin_num: (Label, label_type)}
+            pins = {
+                pin_num: (alias_map.get(label.text, label.text) if label.text else None)
+                for pin_num, (label, _label_type) in pin_labels.items()
+            }
+
         records.append(
             ComponentRecord(
                 identity=ref,
@@ -207,12 +265,31 @@ def build_existing_project_snapshot(project_path: str, alias_map: Optional[Dict[
     """
     synchronizer = HierarchicalSynchronizer(str(project_path))
 
+    # Preferred connectivity source: KiCad's own exported netlist (wayfinder
+    # #63). Exported once for the whole project -- references are unique
+    # project-wide, so one flat {ref: {pin: net}} map serves every sheet.
+    # None (kicad-cli missing, export failed) is a supported outcome and
+    # simply leaves every component on the geometric fallback.
+    netlist_connectivity = load_project_connectivity(synchronizer.root_sheet.file_path)
+    if netlist_connectivity:
+        logger.info(
+            "Reference preallocation: using netlist connectivity for %d component(s)",
+            len(netlist_connectivity),
+        )
+    else:
+        logger.info(
+            "Reference preallocation: netlist connectivity unavailable, "
+            "using geometric pin-label extraction"
+        )
+
     per_sheet: Dict[str, List[ComponentRecord]] = {}
     all_records: List[ComponentRecord] = []
 
     def _walk(sheet: HierarchicalSheet):
         if sheet.synchronizer is not None:
-            records = _existing_records_for_sheet(sheet.synchronizer, alias_map)
+            records = _existing_records_for_sheet(
+                sheet.synchronizer, alias_map, netlist_connectivity
+            )
             per_sheet[sheet.name] = records
             all_records.extend(records)
         for child in sheet.children:
