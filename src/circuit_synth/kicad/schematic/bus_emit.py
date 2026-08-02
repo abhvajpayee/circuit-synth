@@ -228,6 +228,56 @@ def _point_on_segment(p, a, b, tol=_POS_TOL):
     return abs(cross) / seg_len < tol
 
 
+def _parent_tie_positions(txt, bus_label):
+    """Positions of every `bus_label`-named label in `txt` that belongs to a
+    CHILD SHEET SYMBOL's already-collapsed bus-vector pin -- i.e. a tie label
+    `_parent_surgery` created, NOT the head label of this sheet's own bus
+    graphic, even though the two carry identical text.
+
+    A sheet can be a bus's leaf and its parent at the same time (wayfinder
+    #62): the real `acquisition_mcu` root sheet carries the inter-board
+    connector directly (leaf for `ETH_UP_[0..3]`/`ADDR_DRV[0..5]`) while also
+    parenting the `ComputeSetup` child sheet symbol whose per-member pins
+    `_parent_surgery` already collapsed into one bus-vector pin plus a
+    matching vector-named tie label. Every "find this bus's head label"
+    lookup must therefore be position-qualified rather than name-only --
+    the same rule `_parent_surgery`'s own docstring records for the
+    per-member ties it renames and deletes.
+
+    Anchored on the child's own `(pin "<bus_label>" ...)` entry inside the
+    `(sheet ...)` block (`_sheet_pin_positions`), tried at BOTH X
+    conventions for the same reason `_collapsed_pin_positions` does: a
+    mid-level parent's tie sits `_TIE_LABEL_X_OFFSET` from the pin's stored
+    position while a true root's is coincident with it. Trying both is safe
+    -- the offset that doesn't apply simply never matches a real label."""
+    out = set()
+    for x, y in _sheet_pin_positions(txt).get(bus_label, set()):
+        bx, by = float(x), float(y)
+        out.add((bx, by))
+        out.add((bx + _TIE_LABEL_X_OFFSET, by))
+    return out
+
+
+def _bus_head_label_blocks(txt, bus_label):
+    """`[(block_index, position, is_hierarchical), ...]` for every top-level
+    label named `bus_label` that is this sheet's OWN bus-graphic head label
+    -- excluding any that is really a child sheet symbol's collapsed-vector
+    tie (see `_parent_tie_positions`). Block indices are into
+    `_top_level_block_spans(txt)`."""
+    ties = _parent_tie_positions(txt, bus_label)
+    out = []
+    for idx, (start, end) in enumerate(_top_level_block_spans(txt)):
+        block = txt[start:end]
+        m = re.match(r'\t\((hierarchical_label|label|global_label) "([^"]*)"', block)
+        if not m or m.group(2) != bus_label:
+            continue
+        pos = _block_at_xy(block)
+        if pos is not None and any(_points_close(pos, t) for t in ties):
+            continue  # a child sheet symbol's tie, not this sheet's bus head
+        out.append((idx, pos, m.group(1) == "hierarchical_label"))
+    return out
+
+
 def _bus_graphic_intact(txt, bus_label):
     """Tri-state check for whether `bus_label`'s vector-bus graphic is fully
     present in `txt`:
@@ -254,15 +304,18 @@ def _bus_graphic_intact(txt, bus_label):
     (the tie label survives), permanently orphaning each tap's stub wire
     -- its bus-side endpoint no longer connects to anything, which is
     exactly the `unconnected_wire_endpoint` ERC violation this bug
-    reports."""
-    head_pos = None
-    for start, end in _top_level_block_spans(txt):
-        block = txt[start:end]
-        m = re.match(r'\t\((?:hierarchical_label|label|global_label) "([^"]*)"', block)
-        if m and m.group(1) == bus_label:
-            head_pos = _block_at_xy(block)
-            break
-    if head_pos is None:
+    reports.
+
+    The head label is located POSITIONALLY, via `_bus_head_label_blocks` --
+    never as "the first top-level label whose text is `bus_label`". On a
+    sheet that is both this bus's leaf and its parent, that first match can
+    just as easily be a child sheet symbol's collapsed-vector tie label,
+    whose position no `(bus ...)` line will ever start at -- reading a
+    perfectly intact graphic as orphaned and triggering a needless
+    strip-and-redraw on every sync (wayfinder #62)."""
+    heads = _bus_head_label_blocks(txt, bus_label)
+    head_positions = [pos for _, pos, _ in heads if pos is not None]
+    if not head_positions:
         return None
     for start, end in _top_level_block_spans(txt):
         block = txt[start:end]
@@ -271,7 +324,7 @@ def _bus_graphic_intact(txt, bus_label):
             # `(bus ...)` reuses the same (pts (xy a b) (xy c d)) shape as a
             # wire; its first point is the tie label's own anchor (see
             # `_bus_block`: the label sits exactly on the bus wire's start).
-            if pts and _points_close(pts[0], head_pos):
+            if pts and any(_points_close(pts[0], hp) for hp in head_positions):
                 return True
     return False
 
@@ -291,12 +344,15 @@ def _orphaned_head_kind(txt, bus_label):
     a repair pass would silently flip a hierarchical bus tie to a local
     one. The orphaned head label itself is the only remaining record of
     the original decision, so capture it before stripping and force the
-    repair to reuse it."""
-    for start, end in _top_level_block_spans(txt):
-        block = txt[start:end]
-        m = re.match(r'\t\((hierarchical_label|label|global_label) "([^"]*)"', block)
-        if m and m.group(2) == bus_label:
-            return m.group(1) == "hierarchical_label"
+    repair to reuse it.
+
+    Reads only genuine head labels (`_bus_head_label_blocks`), never a child
+    sheet symbol's collapsed-vector tie of the same name -- a parent tie is
+    always a plain `label`, so a name-only first match on a leaf+parent
+    sheet could silently report a hierarchical bus as local (wayfinder
+    #62)."""
+    for _, _, is_hier in _bus_head_label_blocks(txt, bus_label):
+        return is_hier
     return None
 
 
@@ -329,15 +385,24 @@ def _strip_orphaned_bus_graphic(txt, bus_label, candidate_names):
     positions -- a component's own pin, not this stub's wire span). After
     stripping, the sheet reads as "not yet injected" for this bus, so the
     normal detection/redraw path rebuilds a complete, non-duplicated
-    graphic from scratch."""
+    graphic from scratch.
+
+    The head label is matched POSITIONALLY (`_bus_head_label_blocks`), not
+    by name alone. A sheet can be this bus's leaf and its parent at once --
+    the real `acquisition_mcu` root sheet carries the inter-board connector
+    directly while also parenting the `ComputeSetup` child sheet symbol,
+    whose already-collapsed bus-vector pin has a tie label of the SAME
+    vector name. A name-only drop destroyed that tie along with the
+    orphaned head, permanently severing the child sheet from the bus: every
+    stub label on the redrawn graphic then reached only the root-side
+    connector pin, which is KiCad ERC's `isolated_pin_label` (0 -> 53 on
+    the real board in one sync, wayfinder #62). This is the same rule
+    `_parent_surgery`'s docstring already records for the per-member ties it
+    rewrites, applied to the aggregate head label as well."""
     spans = _top_level_block_spans(txt)
     blocks = [txt[s:e] for s, e in spans]
 
-    drop = set()
-    for idx, block in enumerate(blocks):
-        m = re.match(r'\t\((?:hierarchical_label|label|global_label) "([^"]*)"', block)
-        if m and m.group(1) == bus_label:
-            drop.add(idx)
+    drop = {idx for idx, _, _ in _bus_head_label_blocks(txt, bus_label)}
 
     if not drop:
         return txt  # nothing to strip (shouldn't happen; caller already checked)

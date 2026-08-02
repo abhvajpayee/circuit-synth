@@ -538,3 +538,157 @@ def test_incremental_sync_does_not_orphan_aliased_bus_stub_labels(tmp_path):
             f"a second incremental sync reintroduced dangling aliased-bus "
             f"stub labels on {leaf}: {counts}"
         )
+
+
+_ROOT_LEAF_AND_PARENT_SCRIPT = '''
+import sys
+from circuit_synth import Bus, Component, circuit
+
+@circuit(name="child")
+def child(eth, addr):
+    j = Component(symbol="Connector_Generic:Conn_01x10", ref="J")
+    for k in range(4):
+        j[k + 1] += eth[k]
+    for k in range(6):
+        j[k + 5] += addr.members[k]
+
+@circuit(name="root")
+def root():
+    # Aliased bus (the ETH_UP_* class) and plain vector bus (the ADDR_DRV*
+    # class) -- the two shapes the real board reported this symptom on.
+    eth = Bus("ETH_UP", members=["TXP", "TXN", "RXP", "RXN"])
+    addr = Bus("ADDR_DRV", 6)
+    # The root sheet carries its OWN component on both buses (like the real
+    # board's inter-board connector J5 sitting directly on the root sheet),
+    # which makes root a genuine LEAF for each bus...
+    j = Component(symbol="Connector_Generic:Conn_01x10", ref="J")
+    for k in range(4):
+        j[k + 1] += eth[k]
+    for k in range(6):
+        j[k + 5] += addr.members[k]
+    # ...while ALSO being their PARENT, via a child sheet on the same buses.
+    child(eth, addr)
+
+proj_dir = sys.argv[1]
+force = sys.argv[2] == "force"
+root().generate_kicad_project(proj_dir, generate_pcb=False, force_regenerate=force)
+'''
+
+
+def _generate_root_leaf_and_parent_project(proj_dir, force, py_exe):
+    """Run `_ROOT_LEAF_AND_PARENT_SCRIPT` in its own fresh subprocess, for
+    the same reason `_generate_aliased_bus_leaf_project` does -- see that
+    helper's docstring."""
+    result = subprocess.run(
+        [py_exe, "-c", _ROOT_LEAF_AND_PARENT_SCRIPT, proj_dir, "force" if force else "sync"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (
+        f"generation subprocess failed (force={force}):\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def _bus_vector_label_positions(sch_path, bus_label):
+    """Every top-level `(label "<bus_label>" ...)` occurrence's (x, y) in a
+    sheet file -- i.e. both the bus graphic's own head label AND each child
+    sheet symbol's collapsed-vector tie label, which share that same text."""
+    text = open(sch_path).read()
+    return sorted(
+        (float(m.group(1)), float(m.group(2)))
+        for m in re.finditer(
+            r'\t\(label "' + re.escape(bus_label) + r'"\n\t\t\(at ([0-9.\-]+) ([0-9.\-]+) ',
+            text,
+        )
+    )
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="kicad-cli not available")
+def test_incremental_sync_keeps_parent_tie_on_sheet_that_is_also_a_bus_leaf(tmp_path):
+    """Regression test for wayfinder #62: incremental sync must not strip a
+    child sheet symbol's collapsed bus-vector TIE label off a sheet that is
+    simultaneously that same bus's own LEAF.
+
+    `_strip_orphaned_bus_graphic()` (the wayfinder #55 self-healing repair
+    for the `bus`/`bus_entry` elements kicad-sch-api's load/save round-trip
+    silently drops) identified the orphaned graphic's head label BY NAME
+    alone -- dropping *every* top-level label whose text equals the bus's
+    vector name. On a sheet that is only a leaf, or only a parent, there is
+    exactly one such label and that is correct. But a sheet can be both at
+    once: the real `acquisition_mcu` root sheet carries the inter-board
+    connector J5 directly (making root a genuine leaf for `ETH_UP_[0..3]`
+    and `ADDR_DRV[0..5]`) *and* the `ComputeSetup` child sheet symbol whose
+    per-member pins `_parent_surgery()` already collapsed into one
+    bus-vector pin with a matching tie label of that same vector name. The
+    name-only strip destroyed that tie along with the orphaned head,
+    permanently disconnecting the child sheet from the bus -- every stub
+    label on the redrawn graphic then touched only the root-side connector
+    pin, which is KiCad ERC's `isolated_pin_label` ("Label connected to
+    only one pin"). Measured on the real board: 0 -> 53 root-sheet
+    `isolated_pin_label` findings on a single sync.
+
+    `_parent_surgery()`'s own docstring already records the same lesson for
+    the per-member ties it renames/deletes (position-match, never a
+    name-wide substitution, precisely because a file can be a parent and a
+    leaf for one bus at the same time); the head-label strip simply never
+    applied it.
+
+    Fresh generate (force_regenerate=True, never touches APISynchronizer)
+    establishes the baseline; the second and third calls are real
+    incremental syncs in fresh processes."""
+    import json
+    import sys
+
+    proj_dir = str(tmp_path / "sb")
+    _generate_root_leaf_and_parent_project(proj_dir, force=True, py_exe=sys.executable)
+    root_file = os.path.join(proj_dir, "root.kicad_sch")
+
+    def _erc_violation_types(out_path):
+        subprocess.run(
+            ["kicad-cli", "sch", "erc", "-o", out_path, "--format", "json",
+             "--severity-all", root_file],
+            capture_output=True, text=True,
+        )
+        data = json.load(open(out_path))
+        counts = {}
+        for sheet in data.get("sheets", []):
+            for v in sheet.get("violations", []):
+                counts[v["type"]] = counts.get(v["type"], 0) + 1
+        return counts
+
+    baseline = _erc_violation_types(str(tmp_path / "erc_baseline.json"))
+    assert "isolated_pin_label" not in baseline, (
+        f"fresh generation should never isolate a bus pin label: {baseline}"
+    )
+
+    # Both labels must exist to begin with: the bus graphic's head, and the
+    # child sheet symbol's collapsed-vector tie.
+    baseline_ties = {
+        bus: _bus_vector_label_positions(root_file, bus)
+        for bus in ("ETH_UP_[0..3]", "ADDR_DRV[0..5]")
+    }
+    for bus, positions in baseline_ties.items():
+        assert len(positions) >= 2, (
+            f"fresh generation should place both a bus head label and a child "
+            f"sheet-symbol tie label named {bus} on the root sheet, got {positions}"
+        )
+
+    for pass_no in (1, 2):
+        _generate_root_leaf_and_parent_project(proj_dir, force=False, py_exe=sys.executable)
+        after = _erc_violation_types(str(tmp_path / f"erc_after_sync_{pass_no}.json"))
+        assert "isolated_pin_label" not in after, (
+            f"incremental sync pass {pass_no} isolated a bus pin label on a sheet "
+            f"that is both a leaf and a parent of that bus (wayfinder #62 "
+            f"regression): {after}"
+        )
+        assert after == baseline, (
+            f"incremental sync pass {pass_no} changed the root-sheet ERC violation "
+            f"profile for an unchanged circuit: baseline={baseline}, after={after}"
+        )
+        for bus in ("ETH_UP_[0..3]", "ADDR_DRV[0..5]"):
+            positions = _bus_vector_label_positions(root_file, bus)
+            assert len(positions) >= 2, (
+                f"incremental sync pass {pass_no} dropped the child sheet symbol's "
+                f"collapsed-vector tie label for {bus} from the root sheet "
+                f"(only {positions} left)"
+            )
