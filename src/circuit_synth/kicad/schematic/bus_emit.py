@@ -198,6 +198,36 @@ def _points_close(p, q, tol=_POS_TOL):
     return _close(p[0], q[0], tol) and _close(p[1], q[1], tol)
 
 
+def _point_on_segment(p, a, b, tol=_POS_TOL):
+    """Whether point `p` lies on the closed line segment `a`-`b`, within
+    tolerance `tol` -- a bounding-box check plus a collinearity (cross-
+    product) check, not an endpoint-only comparison.
+
+    Needed because an ALIASED bus's tap carries a **dual label** on its stub
+    wire (see module docstring / `_bus_block`): the elaborated name sits at
+    the wire's far endpoint, but the positional name sits at a point
+    *partway along* the same wire (`ex + 2.54`, between the wire's two
+    endpoints, not coincident with either) -- `_points_close` against just
+    `pts[1]` (the old check this replaces) never matches that inner point,
+    so a PLAIN bus's single, endpoint-sited label is still found (this
+    reduces to a degenerate segment check there), but an ALIASED bus's
+    inner positional label was silently left behind by
+    `_strip_orphaned_bus_graphic`, un-stripped -- see that function's
+    docstring for the resulting bug (wayfinder #57)."""
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    if not (min(ax, bx) - tol <= px <= max(ax, bx) + tol):
+        return False
+    if not (min(ay, by) - tol <= py <= max(ay, by) + tol):
+        return False
+    seg_len = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+    if seg_len < tol:
+        return _points_close(p, a, tol)
+    cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+    return abs(cross) / seg_len < tol
+
+
 def _bus_graphic_intact(txt, bus_label):
     """Tri-state check for whether `bus_label`'s vector-bus graphic is fully
     present in `txt`:
@@ -272,17 +302,34 @@ def _orphaned_head_kind(txt, bus_label):
 
 def _strip_orphaned_bus_graphic(txt, bus_label, candidate_names):
     """Remove `bus_label`'s orphaned graphic remnants -- the aggregate tie
-    label plus each tap's now-dangling stub wire and its end label --
-    identified structurally (a `wire` whose far endpoint coincides with a
-    `label` of a name in `candidate_names`), not by this module's own
-    emission format, so it also matches remnants that a kicad-sch-api
-    round-trip has since reformatted (see `_bus_graphic_intact`).
+    label plus each tap's now-dangling stub wire and every label riding on
+    it -- identified structurally (a `wire` with a `label` of a name in
+    `candidate_names` anywhere along its own span, not just at its far
+    endpoint -- see `_point_on_segment`), not by this module's own emission
+    format, so it also matches remnants that a kicad-sch-api round-trip has
+    since reformatted (see `_bus_graphic_intact`).
+
+    A PLAIN bus's tap carries exactly one label, sitting at the stub wire's
+    far endpoint, so an endpoint-only check used to suffice. An ALIASED
+    bus's tap carries a **dual label** (see `_bus_block`): the elaborated
+    name at the far endpoint, but the positional name partway along the
+    SAME wire, not at either endpoint -- an endpoint-only check silently
+    left that inner label behind after the wire itself was dropped,
+    orphaning it (no wire, no bus_entry) -- KiCad ERC's `label_dangling`.
+    Worse, that survivor's text was still the bare positional name, so the
+    normal re-injection pass right after this strip mistook it for a fresh,
+    genuine occurrence and *retexted* it in place to the elaborated alias,
+    rather than recognizing it as stale stub wreckage (wayfinder #57).
+    Checking the label's position against the wire's whole span, not just
+    one endpoint, catches both labels of a dual-label tap together.
 
     Only ever called once `_bus_graphic_intact` has already confirmed the
     `(bus ...)`/`(bus_entry ...)` elements are gone; leaves every genuine
-    per-pin/component label alone. After stripping, the sheet reads as
-    "not yet injected" for this bus, so the normal detection/redraw path
-    rebuilds a complete, non-duplicated graphic from scratch."""
+    per-pin/component label alone (real occurrences sit at unrelated
+    positions -- a component's own pin, not this stub's wire span). After
+    stripping, the sheet reads as "not yet injected" for this bus, so the
+    normal detection/redraw path rebuilds a complete, non-duplicated
+    graphic from scratch."""
     spans = _top_level_block_spans(txt)
     blocks = [txt[s:e] for s, e in spans]
 
@@ -308,12 +355,11 @@ def _strip_orphaned_bus_graphic(txt, bus_label, candidate_names):
             pts = _block_wire_endpoints(block)
             if not pts:
                 continue
-            _, far_end = pts
-            for pos, lidx in label_pos_to_idx.items():
-                if _points_close(pos, far_end):
-                    drop.add(idx)
-                    drop.add(lidx)
-                    break
+            a, b = pts
+            matched = [lidx for pos, lidx in label_pos_to_idx.items() if _point_on_segment(pos, a, b)]
+            if matched:
+                drop.add(idx)
+                drop.update(matched)
 
     out = []
     last = 0
@@ -852,13 +898,35 @@ def inject_buses(project_dir, buses):
         def _leaf_status(own_text):
             """Compute (present, real_by_index, leaf_hier) for one sheet's
             `own_text` against the (never-mutated) `orig` dict for
-            cross-sheet tie lookups."""
+            cross-sheet tie lookups.
+
+            For an ALIASED bus, a leaf's genuine real occurrence may already
+            be retexted to the elaborated alias name rather than the
+            positional member name -- true of every pass after the very
+            first injection, since `_retext_pin_labels` permanently renames
+            it in place. Searching only the positional name (as a plain/
+            vector bus always must, since it has no alias) misses that
+            occurrence entirely on such a pass. This matters specifically
+            on an orphan-repair pass (`_bus_graphic_intact` found a
+            partially-destroyed graphic, see `_strip_orphaned_bus_graphic`):
+            once the orphaned stub's own positional-named remnant is
+            correctly stripped (wayfinder #57 fix), the ONLY remaining
+            occurrence of the positional name in the file may be gone
+            entirely, and skipping the alias-name search would then
+            misclassify this leaf as having zero real connections --
+            silently dropping the whole tap (and its already-correct,
+            already-retexted component-pin connection) instead of
+            redrawing it. Safe to search unconditionally (not just during
+            repair): on a fresh/first pass the alias text doesn't exist yet
+            anywhere, so this is a harmless no-op extra search."""
             tie_label_positions = _tie_label_positions(own_text, members, sheets=orig, this_file=n, bus_label=bus.label)
             present = []
             real_by_index = {}
             leaf_hier = False
             for i, m in enumerate(members):
                 real = _real_label_occurrences(own_text, m, tie_label_positions)
+                if aliased:
+                    real = real + _real_label_occurrences(own_text, alias[i], tie_label_positions)
                 if real:
                     present.append(i)
                     real_by_index[i] = [(x, y) for x, y, _ in real]

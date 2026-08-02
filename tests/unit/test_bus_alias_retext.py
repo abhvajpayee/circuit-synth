@@ -383,3 +383,158 @@ def test_incremental_sync_does_not_orphan_bus_stub_wires(tmp_path):
         "incremental sync changed the ERC violation profile on an unchanged "
         f"circuit: baseline={baseline}, after_sync={after_sync}"
     )
+
+
+_ALIASED_BUS_LEAF_SCRIPT = '''
+import sys
+from circuit_synth import Bus, Component, Net, circuit
+
+@circuit(name="leaf_a")
+def leaf_a(bus, gnd):
+    j = Component(symbol="Connector_Generic:Conn_01x04", ref="J")
+    for k in range(4):
+        j[k + 1] += bus[k]
+
+@circuit(name="leaf_b")
+def leaf_b(bus, gnd):
+    j = Component(symbol="Connector_Generic:Conn_01x04", ref="J")
+    for k in range(4):
+        j[k + 1] += bus[k]
+
+@circuit(name="root")
+def root():
+    gnd = Net("GND")
+    spi = Bus("SPI", members=["SCK", "MISO", "MOSI", "CS"])
+    leaf_a(spi, gnd)
+    leaf_b(spi, gnd)
+
+proj_dir = sys.argv[1]
+force = sys.argv[2] == "force"
+root().generate_kicad_project(proj_dir, generate_pcb=False, force_regenerate=force)
+'''
+
+
+def _generate_aliased_bus_leaf_project(proj_dir, force, py_exe):
+    """Run `_ALIASED_BUS_LEAF_SCRIPT` in its OWN, fresh subprocess -- not as
+    an in-process second/third call to `generate_kicad_project()` -- so each
+    generation gets a fresh circuit-synth reference-numbering registry,
+    exactly like a real incremental sync (each is a separate `python3
+    <script>.py` invocation, e.g. this project's `acquisition.py`). Calling
+    `generate_kicad_project()` a 2nd/3rd time in-process against brand-new
+    `@circuit`-decorated root objects (rather than the SAME object) hits an
+    unrelated auto-ref-numbering artifact (found while writing this test:
+    a fresh top-level circuit object's ref counter does not reliably
+    restart at the existing schematic's own next-free number past the
+    second such in-process construction, misidentifying every component as
+    removed+re-added and corrupting the run) -- out of scope for wayfinder
+    #57, and irrelevant to real usage, so this test avoids it entirely by
+    using separate processes instead."""
+    result = subprocess.run(
+        [py_exe, "-c", _ALIASED_BUS_LEAF_SCRIPT, proj_dir, "force" if force else "sync"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (
+        f"generation subprocess failed (force={force}):\\n"
+        f"stdout:\\n{result.stdout}\\nstderr:\\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="kicad-cli not available")
+def test_incremental_sync_does_not_orphan_aliased_bus_stub_labels(tmp_path):
+    """Regression test for wayfinder #57: incremental sync (force_regenerate
+    left at its False default, the real APISynchronizer/kicad-sch-api
+    round-trip path) against an ALIASED cross-sheet Bus must not introduce
+    a `label_dangling` ERC finding -- even though the #55 fix already made
+    the analogous PLAIN-bus case (`test_incremental_sync_does_not_orphan_bus_stub_wires`
+    above) fully clean.
+
+    An aliased bus's tap draws a **dual label** on its stub wire (see
+    `bus_emit._bus_block`): the elaborated alias name sits at the wire's
+    far endpoint, but the positional name sits partway along the same
+    wire -- neither coincident with the wire's other endpoint. The #55 fix
+    (`_bus_graphic_intact` / `_strip_orphaned_bus_graphic`) only matched a
+    dangling label at a wire's far endpoint, so it fully repaired a plain
+    bus's single-label tap but left an aliased bus's inner (positional)
+    label behind -- and worse, the very next re-injection pass mistook that
+    survivor for a fresh, genuine connection and retexted it in place to
+    the elaborated alias, landing it, still with no wire, as a stable
+    (non-growing but still wrong) `label_dangling` finding on every
+    subsequent sync.
+
+    Fresh generate (force_regenerate=True) establishes a clean baseline on
+    each leaf sheet (the dual-label tap is fully formed); the SECOND call
+    (a fresh process, force_regenerate defaulting to False against the
+    already-generated project directory) is the real incremental-sync path
+    and must reproduce the identical, zero-`label_dangling` ERC profile --
+    checked on BOTH leaf sheets (where the dual-label stub actually lives),
+    not just the root sheet (which only ties sibling children and never
+    carries this bus's own stub labels). A THIRD call repeats the sync
+    again, since the #57 bug was reported stable/non-growing across
+    repeated syncs, not a one-time event."""
+    import json
+    import sys
+
+    proj_dir = str(tmp_path / "sb")
+    _generate_aliased_bus_leaf_project(proj_dir, force=True, py_exe=sys.executable)
+
+    def _erc_violation_types(sch_file, out_path):
+        subprocess.run(
+            ["kicad-cli", "sch", "erc", "-o", out_path, "--format", "json",
+             "--severity-all", sch_file],
+            capture_output=True, text=True,
+        )
+        data = json.load(open(out_path))
+        counts = {}
+        for sheet in data.get("sheets", []):
+            for v in sheet.get("violations", []):
+                counts[v["type"]] = counts.get(v["type"], 0) + 1
+        return counts
+
+    leaf_files = {
+        leaf: os.path.join(proj_dir, f"{leaf}.kicad_sch")
+        for leaf in ("leaf_a", "leaf_b")
+    }
+
+    baseline = {
+        leaf: _erc_violation_types(f, str(tmp_path / f"erc_baseline_{leaf}.json"))
+        for leaf, f in leaf_files.items()
+    }
+    for leaf, counts in baseline.items():
+        assert "label_dangling" not in counts, (
+            f"fresh generation should never have a dangling bus-tap label "
+            f"on {leaf}: {counts}"
+        )
+
+    # The incremental-sync call: same circuit, same project dir, no Python
+    # source changes, force_regenerate defaulting to False -- this is what
+    # reaches APISynchronizer.sync_with_circuit() via kicad-sch-api, the
+    # round-trip that drops native `bus`/`bus_entry` elements.
+    _generate_aliased_bus_leaf_project(proj_dir, force=False, py_exe=sys.executable)
+
+    after_sync = {
+        leaf: _erc_violation_types(f, str(tmp_path / f"erc_after_sync_{leaf}.json"))
+        for leaf, f in leaf_files.items()
+    }
+    for leaf, counts in after_sync.items():
+        assert "label_dangling" not in counts, (
+            "incremental sync introduced a dangling aliased-bus stub label on "
+            f"{leaf} (wayfinder #57 regression): {counts}"
+        )
+        assert counts == baseline[leaf], (
+            f"incremental sync changed the ERC violation profile on {leaf} "
+            f"for an unchanged circuit: baseline={baseline[leaf]}, after_sync={counts}"
+        )
+
+    # And a second incremental sync must stay just as clean (the #57 bug
+    # was reported stable/non-growing across repeated syncs, not something
+    # that only shows up once).
+    _generate_aliased_bus_leaf_project(proj_dir, force=False, py_exe=sys.executable)
+    after_second_sync = {
+        leaf: _erc_violation_types(f, str(tmp_path / f"erc_after_2nd_sync_{leaf}.json"))
+        for leaf, f in leaf_files.items()
+    }
+    for leaf, counts in after_second_sync.items():
+        assert "label_dangling" not in counts, (
+            f"a second incremental sync reintroduced dangling aliased-bus "
+            f"stub labels on {leaf}: {counts}"
+        )
