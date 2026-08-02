@@ -19,7 +19,7 @@ import logging
 import kicad_sch_api as ksa
 import pytest
 
-from circuit_synth import Component, Net, circuit
+from circuit_synth import Bus, Component, Net, circuit
 from circuit_synth.core.decorators import set_current_circuit
 
 logging.getLogger("circuit_synth").setLevel(logging.WARNING)
@@ -184,3 +184,132 @@ def test_duplicate_zero_ohm_ties_real_project(tmp_path):
 
     assert refs_before.issubset(refs_after), "all 4 pre-existing tie resistors must keep their references"
     assert len(refs_after) == 5
+
+
+def test_aliased_bus_unique_connectivity_matcher_gap(tmp_path):
+    """wayfinder #59: R26-class miss -- a component connected to an ALIASED
+    Bus member must still be identity-matched on resync even though its own
+    connectivity is completely unique (no duplicate-signature tiebreak
+    involved at all -- this is deliberately NOT #58's already-covered 4x0R
+    tiebreak scenario above).
+
+    Root cause: ``bus_emit.py``'s aliased-Bus dual-label convention retexts
+    a tapped pin's label from the bus member's canonical/positional net name
+    (``SIG_0``) to its elaborated alias (``SIG_A``) *in place*, for
+    on-schematic readability -- so the *existing* (old) side's connectivity
+    extraction (``reference_preallocator._existing_records_for_sheet()``,
+    via ``APISynchronizer._get_pin_labels()``) sees the alias text, while
+    the *new* (Python) side's own signature always uses the canonical
+    ``pin.net.name`` (``core/circuit.py``'s ``collect_preallocation_records``).
+    Every aliased-bus-connected pin's token therefore NEVER equalled across
+    the two sides, so no aliased-bus-connected component could ever
+    preallocation-match, deterministically -- regardless of how unique its
+    own connectivity otherwise was.
+
+    (In the real ``acquisition_mcu`` board this presented as a
+    seemingly-arbitrary "R25 matches, R26 doesn't" asymmetry between two
+    structurally-identical series-termination resistors, because a handful
+    of components got incidentally rescued by a *separate*, coarser legacy
+    fuzzy matcher elsewhere in the sync pipeline (``_match_components``'s
+    own position/connectivity-tracer strategies) that succeeds
+    unpredictably -- exactly the unreliable fallback behavior issue #58 was
+    chartered to eliminate. This test isolates the deterministic root cause
+    directly, without depending on that second matcher's own luck: BOTH
+    resistors below are shown to lose identity against the parent commit,
+    not just one.)
+
+    Two series resistors tap two DIFFERENT members of one aliased Bus, each
+    with its own uniquely-named driver-side net (mirroring this project's
+    real ``_ser()`` house pattern of ``Net(f"{ref}_D")`` -> R -> bus
+    member) -- genuinely unique, non-duplicate connectivity on both sides.
+    An unrelated component inserted into an earlier-traversed sheet on the
+    second generation forces the classic global-counter renumbering cascade
+    (the #55/#58 trigger). Both series resistors must keep their original
+    reference AND UUID.
+    """
+    project_dir = tmp_path / "proj"
+    _start_fresh_top_level_build()
+
+    @circuit(name="Early")
+    def early_v1():
+        gnd = Net("GND")
+        vcc = Net("VCC")
+        r = Component(symbol="Device:R", ref="R", value="10k")
+        r[1] += vcc
+        r[2] += gnd
+
+    @circuit(name="Main")
+    def main():
+        gnd = Net("GND")
+        bus = Bus("SIG", members=["A", "B"])
+        drv_a = Net("R_A_D")
+        ra = Component(symbol="Device:R", ref="R", value="33R")
+        ra[1] += drv_a
+        ra[2] += bus["A"]
+        drv_b = Net("R_B_D")
+        rb = Component(symbol="Device:R", ref="R", value="33R")
+        rb[1] += drv_b
+        rb[2] += bus["B"]
+
+    @circuit(name="root")
+    def root_v1():
+        early_v1()
+        main()
+
+    c1 = root_v1()
+    result1 = c1.generate_kicad_project(
+        str(project_dir), generate_pcb=False, force_regenerate=False, update_source_refs=False
+    )
+    assert result1["success"]
+
+    sch_main_before = ksa.Schematic.load(str(project_dir / "Main.kicad_sch"))
+    before_by_uuid = {
+        c.uuid: c.reference for c in sch_main_before.components if not c.reference.startswith("#")
+    }
+    assert len(before_by_uuid) == 2, "expected exactly the two series resistors on Main"
+
+    # --- second generation: an unrelated component inserted into the
+    # EARLIER-traversed "Early" sheet -- Main's own source is byte-for-byte
+    # unchanged, but the global per-prefix "R" counter shifts underneath it.
+    # ---
+    _start_fresh_top_level_build()
+
+    @circuit(name="Early")
+    def early_v2():
+        gnd = Net("GND")
+        vcc = Net("VCC")
+        sig_new = Net("SIG_NEW")
+        r_new = Component(symbol="Device:R", ref="R", value="1k")  # <-- new, shifts the counter
+        r_new[1] += sig_new
+        r_new[2] += gnd
+        r = Component(symbol="Device:R", ref="R", value="10k")
+        r[1] += vcc
+        r[2] += gnd
+
+    @circuit(name="root")
+    def root_v2():
+        early_v2()
+        main()
+
+    c2 = root_v2()
+    result2 = c2.generate_kicad_project(
+        str(project_dir), generate_pcb=False, force_regenerate=False, update_source_refs=False
+    )
+    assert result2["success"]
+
+    sch_main_after = ksa.Schematic.load(str(project_dir / "Main.kicad_sch"))
+    after_by_uuid = {
+        c.uuid: c.reference for c in sch_main_after.components if not c.reference.startswith("#")
+    }
+    assert len(after_by_uuid) == 2, "Main's own two resistors must not multiply or vanish"
+
+    for old_uuid, old_ref in before_by_uuid.items():
+        assert old_uuid in after_by_uuid, (
+            f"component {old_ref} (uuid {old_uuid}) lost its identity across resync -- "
+            "an aliased-bus-connected component with unique connectivity failed to "
+            "preallocation-match (wayfinder #59 R26-class miss)"
+        )
+        assert after_by_uuid[old_uuid] == old_ref, (
+            f"component {old_ref} kept its UUID but was renumbered to "
+            f"{after_by_uuid[old_uuid]} -- preallocation matched it to the wrong reference"
+        )

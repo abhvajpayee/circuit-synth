@@ -78,7 +78,29 @@ from .hierarchical_synchronizer import HierarchicalSheet, HierarchicalSynchroniz
 logger = logging.getLogger(__name__)
 
 
-def _existing_records_for_sheet(synchronizer) -> List[ComponentRecord]:
+def _build_alias_map(top_circuit) -> Dict[str, str]:
+    """Build an ``{elaborated_alias_name: canonical_positional_net_name}``
+    lookup across every aliased :class:`~circuit_synth.core.bus.Bus` in
+    ``top_circuit`` (and all its subcircuits), for normalizing the existing
+    KiCad project's on-disk pin labels back to the same canonical net-name
+    vocabulary the new (Python) side always uses -- see
+    :func:`_existing_records_for_sheet`'s docstring for why this is needed.
+
+    Only aliased buses contribute entries (``Bus.translations`` is empty for
+    a plain vector bus, which was never retexted in the first place). A
+    plain-vector-bus member's own name IS its canonical name already, so it
+    needs no entry here.
+    """
+    alias_map: Dict[str, str] = {}
+    for bus in top_circuit._all_buses():
+        for positional_name, alias_name in bus.translations:
+            alias_map[alias_name] = positional_name
+    return alias_map
+
+
+def _existing_records_for_sheet(
+    synchronizer, alias_map: Optional[Dict[str, str]] = None
+) -> List[ComponentRecord]:
     """Build ComponentRecords for every real (non-power-symbol) component
     directly on one loaded sheet.
 
@@ -102,9 +124,41 @@ def _existing_records_for_sheet(synchronizer) -> List[ComponentRecord]:
     computed pin positions, not wire-traced net objects) -- so it's the
     correct existing machinery to reuse here, not the superficially
     simpler kicad_sch_api net API.
+
+    Alias normalization (wayfinder #59)
+    ------------------------------------
+    ``_get_pin_labels()`` returns whatever label text is actually sitting at
+    a pin's position, verbatim. For a pin wired to an *aliased* Bus member
+    (``Bus(name, members=[...])``), that text is **not** the bus member's
+    canonical, positional net name (``ETH_8``) -- ``bus_emit.py``'s
+    ``_retext_pin_labels()`` rewrites every real per-pin occurrence of the
+    positional name to the member's elaborated alias (``ETH_TX_EN``) *in
+    place*, for on-schematic readability. This is a label-only rewrite (the
+    underlying KiCad net identity, and this module's own new/Python-side
+    signatures via ``pin.net.name``, both stay canonical/positional) -- but
+    it means a naive ``label.text`` comparison between the two sides can
+    never agree for any aliased-bus-connected pin: the existing/old side
+    always yields the alias form, the new/Python side always yields the
+    canonical form. Confirmed empirically (wayfinder #59 investigation):
+    with no normalization, this made the connectivity-signature matcher
+    fail for essentially every ``_ser()``-created series-termination
+    resistor and other aliased-bus-connected component in this project --
+    a handful appeared to "match" anyway only because they got rescued by
+    the separate, coarser legacy fuzzy matcher (``_match_components``'s own
+    ``ConnectionTracer``/position-based strategies) elsewhere in the sync
+    pipeline, which succeeds unpredictably -- the exact unreliable fallback
+    behavior issue #58 was chartered to eliminate. ``alias_map`` (built by
+    :func:`_build_alias_map` from the *new* side's own live ``Bus`` objects,
+    the single source of truth for which alias maps to which canonical net)
+    translates any alias-form label text back to its canonical form before
+    it ever becomes part of a signature, restoring an apples-to-apples
+    comparison. Text not present in ``alias_map`` (already-canonical names,
+    net names outside any aliased bus, power-net names, etc.) passes through
+    unchanged.
     """
     records = []
     schematic = synchronizer.schematic
+    alias_map = alias_map or {}
     for comp in schematic.components:
         ref = getattr(comp, "reference", None)
         if not ref or ref.startswith("#"):
@@ -112,7 +166,8 @@ def _existing_records_for_sheet(synchronizer) -> List[ComponentRecord]:
         prefix = ref_prefix(ref)
         pin_labels = synchronizer._get_pin_labels(comp)  # {pin_num: (Label, label_type)}
         pins: Dict[str, Optional[str]] = {
-            pin_num: (label.text or None) for pin_num, (label, _label_type) in pin_labels.items()
+            pin_num: (alias_map.get(label.text, label.text) if label.text else None)
+            for pin_num, (label, _label_type) in pin_labels.items()
         }
         records.append(
             ComponentRecord(
@@ -125,7 +180,7 @@ def _existing_records_for_sheet(synchronizer) -> List[ComponentRecord]:
     return records
 
 
-def build_existing_project_snapshot(project_path: str):
+def build_existing_project_snapshot(project_path: str, alias_map: Optional[Dict[str, str]] = None):
     """Load an existing KiCad project and build (per_sheet, global_net_map)
     -- the same shape core/reference_preallocation.py's matcher expects for
     the "existing" side, keyed by KiCad sheet name.
@@ -134,6 +189,13 @@ def build_existing_project_snapshot(project_path: str):
         project_path: path to the project's ``.kicad_pro`` file (or its
             directory -- the root ``.kicad_sch``/``root.kicad_sch`` is
             resolved the same way ``HierarchicalSynchronizer`` does).
+        alias_map: optional ``{elaborated_alias_name: canonical_net_name}``
+            lookup (see :func:`_build_alias_map`) used to normalize any
+            aliased-bus pin label text back to its canonical, positional
+            form -- see :func:`_existing_records_for_sheet`'s "Alias
+            normalization" docstring section for why this is needed.
+            ``None``/empty is safe (no normalization applied), which is
+            correct for a project with no aliased buses at all.
 
     Returns:
         (per_sheet, global_net_map): ``per_sheet`` maps each sheet's own
@@ -150,7 +212,7 @@ def build_existing_project_snapshot(project_path: str):
 
     def _walk(sheet: HierarchicalSheet):
         if sheet.synchronizer is not None:
-            records = _existing_records_for_sheet(sheet.synchronizer)
+            records = _existing_records_for_sheet(sheet.synchronizer, alias_map)
             per_sheet[sheet.name] = records
             all_records.extend(records)
         for child in sheet.children:
@@ -187,7 +249,10 @@ def preallocate_from_existing_project(top_circuit, project_path: str) -> Dict[st
     first/clean generation must be unaffected by this step).
     """
     try:
-        existing_per_sheet, existing_global_map = build_existing_project_snapshot(project_path)
+        alias_map = _build_alias_map(top_circuit)
+        existing_per_sheet, existing_global_map = build_existing_project_snapshot(
+            project_path, alias_map
+        )
     except Exception:
         logger.warning(
             "Could not load existing project for reference preallocation -- "
