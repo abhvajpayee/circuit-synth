@@ -210,6 +210,37 @@ def find_pin_by_identifier(pins, identifier):
     return None
 
 
+def pin_tip_xy(comp, pin_identifier) -> Optional[Tuple[float, float]]:
+    """Absolute (x, y) of a component pin tip in schematic space.
+
+    Single source of the pin-tip math used both by generation
+    (``SchematicWriter._add_no_connect_markers``) and by incremental sync
+    (``APISynchronizer._reconcile_no_connect_markers``), so a marker written by
+    one path is found at the same coordinate by the other. Matches the label
+    placement math in ``_add_pin_level_net_labels`` (no mirror dependency).
+
+    Args:
+        comp: A placed ``SchematicSymbol`` (needs ``lib_id``, ``position``, ``rotation``)
+        pin_identifier: Pin id, number or name, as accepted by ``find_pin_by_identifier``
+
+    Returns:
+        (x, y) in mm, or None if the symbol or pin cannot be resolved.
+    """
+    lib_data = SymbolLibCache.get_symbol_data(comp.lib_id)
+    if not lib_data or "pins" not in lib_data:
+        return None
+    pin_dict = find_pin_by_identifier(lib_data["pins"], pin_identifier)
+    if not pin_dict:
+        return None
+    anchor_x = float(pin_dict.get("x", 0.0))
+    anchor_y = float(pin_dict.get("y", 0.0))
+    r = math.radians(comp.rotation)
+    local_x, local_y = anchor_x, -anchor_y
+    rx = (local_x * math.cos(r)) - (local_y * math.sin(r))
+    ry = (local_x * math.sin(r)) + (local_y * math.cos(r))
+    return (comp.position.x + rx, comp.position.y + ry)
+
+
 def validate_arc_geometry(start, mid, end):
     """
     Validate that an arc has valid geometry.
@@ -1883,21 +1914,9 @@ class SchematicWriter:
             )
 
     def _pin_xy(self, comp, pin_identifier):
-        """Absolute (x, y) of a component pin tip, matching the label placement math
-        in _add_pin_level_net_labels (no mirror dependency)."""
-        lib_data = SymbolLibCache.get_symbol_data(comp.lib_id)
-        if not lib_data or "pins" not in lib_data:
-            return None
-        pin_dict = find_pin_by_identifier(lib_data["pins"], pin_identifier)
-        if not pin_dict:
-            return None
-        anchor_x = float(pin_dict.get("x", 0.0))
-        anchor_y = float(pin_dict.get("y", 0.0))
-        r = math.radians(comp.rotation)
-        local_x, local_y = anchor_x, -anchor_y
-        rx = (local_x * math.cos(r)) - (local_y * math.sin(r))
-        ry = (local_x * math.sin(r)) + (local_y * math.cos(r))
-        return (comp.position.x + rx, comp.position.y + ry)
+        """Absolute (x, y) of a component pin tip. Thin delegate to the
+        module-level `pin_tip_xy`, which incremental sync shares."""
+        return pin_tip_xy(comp, pin_identifier)
 
     def _draw_cap_bank_rails(self):
         """Draw the two shared rails for each bank, one net marker per rail."""

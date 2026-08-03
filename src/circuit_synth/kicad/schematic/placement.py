@@ -71,6 +71,11 @@ class PlacementEngine:
     Handles automatic component placement with collision detection.
     """
 
+    #: Safety bound on the overflow-band grid walk (_find_overflow_position).
+    #: The band is unbounded downwards so the walk terminates well before this;
+    #: the cap only guarantees the loop cannot spin on pathological input.
+    OVERFLOW_MAX_ATTEMPTS = 10000
+
     def __init__(
         self,
         schematic: Schematic,
@@ -91,6 +96,14 @@ class PlacementEngine:
         self._symbol_geometry = SymbolGeometry()
         # Default to A4 if no sheet size provided
         self.sheet_size = sheet_size if sheet_size else (210.0, 297.0)
+        # Top edge of the overflow band used once the bounded search runs out
+        # of room (see _find_overflow_position). Computed lazily from the
+        # content present at the first overflow and then reused, so a run of
+        # overflowing components packs into rows instead of marching one row
+        # further down each time. Only affects packing density -- every
+        # candidate is still collision-checked, so a stale anchor can never
+        # produce an overlap.
+        self._overflow_anchor_y: Optional[float] = None
 
     def find_position(
         self,
@@ -443,16 +456,20 @@ class PlacementEngine:
 
             attempts += 1
 
-        # Fallback
+        # Bounded search exhausted -- fall back to the overflow band rather
+        # than to a constant point (see _find_overflow_position).
         print(
             f"\n⚠️  WARNING: Could not find available position after {attempts} attempts!"
         )
-        print(f"   Falling back to origin: ({self.margin:.1f}, {self.margin:.1f})")
         print(f"{'='*80}\n")
         logger.warning(
-            "Could not find available position with dynamic spacing, using origin"
+            "No position available inside the nominal sheet for %s; "
+            "using the overflow region below existing content",
+            getattr(component, "reference", "<unknown>"),
         )
-        return (self.margin, self.margin)
+        return self._find_overflow_position(
+            component_size, occupied_bounds, spacing_x, spacing_y
+        )
 
     def _find_next_available_position_with_size(
         self, component_size: Tuple[float, float]
@@ -548,9 +565,115 @@ class PlacementEngine:
 
             attempts += 1
 
-        # Fallback - place at origin if no position found
-        logger.warning("Could not find available position, using origin")
-        return (self.margin, self.margin)
+        # Bounded search exhausted -- same overflow fallback as the
+        # component-aware path above.
+        logger.warning(
+            "No position available inside the nominal sheet; using the "
+            "overflow region below existing content"
+        )
+        return self._find_overflow_position(
+            component_size, occupied_bounds, spacing_x, spacing_y
+        )
+
+    def _find_overflow_position(
+        self,
+        component_size: Tuple[float, float],
+        occupied_bounds: List[ElementBounds],
+        spacing_x: float = 5.08,
+        spacing_y: float = 5.08,
+    ) -> Tuple[float, float]:
+        """
+        Find a position for an element that does not fit inside the nominal sheet.
+
+        The bounded row-major search in ``_find_next_available_position`` gives up
+        once it walks past ``sheet_size``. Its previous fallback returned the
+        constant ``(margin, margin)``, which was wrong in two independent ways:
+        that point was never collision-checked, and being constant it returned
+        the *same* point for every subsequent overflow, so N overflowing elements
+        landed exactly on top of each other. Coincident elements have coincident
+        pins, and the pin-label writer emits one label per position -- so a stack
+        of N components silently loses N-1 pin connections.
+
+        This replacement lays overflowing elements out on a collision-checked
+        grid in an *unbounded* region starting below every currently occupied
+        bound. Placing outside the existing content's extent is deliberate: the
+        collision model here knows element bounding boxes only, with no model of
+        wires, labels, junctions or no-connect markers, so the interior gaps of
+        an already-populated sheet are exactly where an unmodelled collision
+        would occur.
+
+        The nominal bound itself is intentionally left alone. Whether the sheet
+        is "full" is not a meaningful question in this codebase -- generation
+        routinely writes content far past the declared paper size -- but the
+        bounded search's *success* path is shared with ``project_generator`` and
+        ``component_manager``, so it is kept bit-for-bit unchanged and only the
+        already-broken exhausted case is redefined.
+
+        Args:
+            component_size: (width, height) of the element in mm
+            occupied_bounds: Bounds of everything already placed
+            spacing_x: Horizontal clearance between elements in mm
+            spacing_y: Vertical clearance between elements in mm
+
+        Returns:
+            (x, y) centre position in mm, snapped to grid
+        """
+        width, height = component_size
+
+        if not occupied_bounds:
+            # Nothing to avoid; anchor at the margin.
+            return self._snap_to_grid(
+                (self.margin + width / 2, self.margin + height / 2)
+            )
+
+        if self._overflow_anchor_y is None:
+            self._overflow_anchor_y = (
+                max(b.bottom for b in occupied_bounds) + spacing_y
+            )
+            logger.debug(
+                "Overflow band anchored at y=%.2f", self._overflow_anchor_y
+            )
+
+        # Rows wrap at whichever is wider: the nominal page or the real content.
+        row_limit = max(
+            self.sheet_size[0], max(b.right for b in occupied_bounds)
+        )
+
+        x = self.margin + width / 2
+        y = self._overflow_anchor_y + height / 2
+
+        for _ in range(self.OVERFLOW_MAX_ATTEMPTS):
+            test_bounds = ComponentBounds(
+                x - width / 2, y - height / 2, width, height
+            )
+            hit = None
+            for occupied in occupied_bounds:
+                if test_bounds.overlaps(occupied):
+                    hit = occupied
+                    break
+
+            if hit is None:
+                position = self._snap_to_grid((x, y))
+                logger.debug(
+                    "Overflow placement at (%.2f, %.2f)", position[0], position[1]
+                )
+                return position
+
+            # Jump clear of the blocking element, wrapping to the next row of
+            # the band when the row is used up.
+            x = max(x + width + spacing_x, hit.right + spacing_x + width / 2)
+            if x + width / 2 > row_limit:
+                x = self.margin + width / 2
+                y += height + spacing_y
+
+        # Unreachable in practice (the band is unbounded downwards), but keep a
+        # guaranteed-clear answer rather than a colliding one: strictly below
+        # everything currently occupied.
+        y = max(b.bottom for b in occupied_bounds) + spacing_y + height / 2
+        logger.warning(
+            "Overflow grid search exhausted; placing below all existing content"
+        )
+        return self._snap_to_grid((self.margin + width / 2, y))
 
     def _find_grid_position(
         self, component: Optional[SchematicSymbol]

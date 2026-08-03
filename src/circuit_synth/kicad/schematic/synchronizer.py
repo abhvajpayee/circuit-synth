@@ -10,7 +10,7 @@ import math
 import uuid as uuid_module
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import kicad_sch_api as ksa
 from kicad_sch_api.core.types import Label, LabelType, Point, Schematic, SchematicSymbol
@@ -20,6 +20,7 @@ from .component_manager import ComponentManager
 from .connection_tracer import ConnectionTracer
 from .label_manager import LabelManager
 from .net_matcher import NetMatcher
+from .placement import PlacementStrategy
 from .search_engine import SearchEngine, SearchQueryBuilder
 from .sync_strategies import (
     ConnectionMatchStrategy,
@@ -131,6 +132,8 @@ class SyncReport:
     labels_added: List[Tuple[str, str, str]] = field(default_factory=list)  # (component, pin, net)
     labels_removed: List[Tuple[str, str, str]] = field(default_factory=list)  # (component, pin, net)
     labels_updated: List[Tuple[str, str, str, str]] = field(default_factory=list)  # (component, pin, old_net, new_net)
+    no_connects_added: List[Tuple[str, str]] = field(default_factory=list)  # (component, pin)
+    no_connects_removed: List[Tuple[str, str]] = field(default_factory=list)  # (component, pin)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for compatibility."""
@@ -465,6 +468,19 @@ class APISynchronizer:
                 for comp_ref, pin, old_net, new_net in sorted(report.labels_updated):
                     print(f"      {comp_ref} pin {pin}: '{old_net}' → '{new_net}'")
 
+        if report.no_connects_added or report.no_connects_removed:
+            print("\nNo-Connect Markers:")
+
+            if report.no_connects_added:
+                print(f"   ➕ Added {len(report.no_connects_added)} marker(s):")
+                for comp_ref, pin in sorted(report.no_connects_added):
+                    print(f"      {comp_ref} pin {pin}")
+
+            if report.no_connects_removed:
+                print(f"   ➖ Removed {len(report.no_connects_removed)} stale marker(s):")
+                for comp_ref, pin in sorted(report.no_connects_removed):
+                    print(f"      {comp_ref} pin {pin} (now wired)")
+
         print("=" * 70 + "\n")
 
     def _extract_circuit_components(self, circuit) -> Dict[str, Dict[str, Any]]:
@@ -490,6 +506,43 @@ class APISynchronizer:
 
         # Get all components recursively
         all_components = get_all_components(circuit)
+
+        # Pins declared Pin.no_connect(), keyed by reference. Two shapes reach
+        # this method: a live circuit-synth Circuit (pins carry the flag
+        # themselves, read by _extract_no_connect_pins below) and -- on the
+        # actual sync path -- a circuit_loader-built circuit, whose components
+        # are SchematicSymbols with no such flag and whose no-connect state
+        # lives in `circuit.no_connect_pins` as (ref, pin_identifier, reason)
+        # tuples. Both are consulted so either entry point works.
+        loader_no_connects: Dict[str, Set[str]] = {}
+
+        def as_sequence(owner, attribute):
+            # Only real sequences, never whatever an attribute happens to be:
+            # `circuit` is a test double (Mock) in several existing callers, on
+            # which any attribute access auto-creates a non-iterable object.
+            value = getattr(owner, attribute, None)
+            return value if isinstance(value, (list, tuple, set)) else ()
+
+        def collect_no_connects(circ):
+            for entry in as_sequence(circ, "no_connect_pins"):
+                try:
+                    ref, pin_identifier = entry[0], entry[1]
+                except (TypeError, IndexError, KeyError):
+                    continue
+                loader_no_connects.setdefault(str(ref), set()).add(str(pin_identifier))
+            for subcircuit in as_sequence(circ, "_subcircuits"):
+                collect_no_connects(subcircuit)
+            for child in as_sequence(circ, "child_instances"):
+                sub = child.get("sub_circuit") if isinstance(child, dict) else None
+                if sub is not None:
+                    collect_no_connects(sub)
+
+        collect_no_connects(circuit)
+        if loader_no_connects:
+            logger.debug(
+                "Circuit declares no-connect pins on %d component(s)",
+                len(loader_no_connects),
+            )
 
         for comp in all_components:
             # Debug: Check component type and attributes
@@ -524,6 +577,10 @@ class APISynchronizer:
                 "position": comp_position,  # Position for rename detection
                 "uuid": comp_uuid,  # UUID for stable component identity
                 "pins": self._extract_pin_info(comp),
+                "no_connect_pins": (
+                    self._extract_no_connect_pins(comp)
+                    | loader_no_connects.get(str(comp_ref), set())
+                ),
                 "original": comp,
             }
 
@@ -561,6 +618,28 @@ class APISynchronizer:
                 if pin.net:
                     pins[pin_num] = pin.net.name
         return pins
+
+    def _extract_no_connect_pins(self, component) -> Set[str]:
+        """Pin numbers this component declares as `Pin.no_connect()`.
+
+        The generation path reads the same state via `Component.to_dict()`'s
+        per-pin "no_connect" field (circuit_loader -> `circuit.no_connect_pins`
+        -> `SchematicWriter._add_no_connect_markers`). Sync reads it straight
+        off the live `Pin` objects, which is the same source of truth without
+        the JSON round-trip.
+        """
+        no_connects = set()
+        pins = getattr(component, "_pins", None)
+        if not isinstance(pins, dict):
+            # Test doubles (Mock) auto-create `_pins` as a non-dict; and
+            # loader-built SchematicSymbols have no `_pins` at all -- their
+            # no-connect state is collected separately from the circuit's own
+            # `no_connect_pins` list.
+            return no_connects
+        for pin_num, pin in pins.items():
+            if getattr(pin, "is_no_connect", False) is True:
+                no_connects.add(str(pin_num))
+        return no_connects
 
     def _get_pin_labels(self, kicad_component: SchematicSymbol) -> Dict[str, tuple]:
         """
@@ -1260,6 +1339,156 @@ class APISynchronizer:
                 # No change needed
                 logger.debug(f"    ✅ KEEP label: pin {pin_num} -> {python_net}")
 
+        self._reconcile_no_connect_markers(
+            circuit_comp, kicad_comp, python_pins, report
+        )
+
+    def _reconcile_no_connect_markers(
+        self,
+        circuit_comp: Dict,
+        kicad_comp: SchematicSymbol,
+        python_pins: Dict[str, str],
+        report: SyncReport,
+    ):
+        """
+        Reconcile KiCad `(no_connect ...)` markers against the Python source.
+
+        Markers were previously written only by the fresh-generate path
+        (`SchematicWriter._add_no_connect_markers`); this module had no notion of
+        them at all. So an incremental sync neither created a marker for a pin
+        newly given `Pin.no_connect()`, nor removed one for a pin that stopped
+        being no-connect and got wired instead. The second case is the damaging
+        one: the pin's label is rewritten to the new net while the stale marker
+        stays behind on the same point, which is exactly KiCad ERC's
+        `no_connect_connected` ("a pin with a 'no connection' flag is
+        connected"). Found in windTunnelProject wayfinder #64, where seven MCU
+        GPIOs were repurposed out of a no-connect registry into front-panel user
+        I/O and every one of them kept its stale marker.
+
+        Keyed on the pin tip coordinate from `pin_tip_xy`, the same helper
+        generation uses to write markers in the first place.
+
+        Removal is driven by *positive* evidence -- the pin now carries a net in
+        the Python source -- rather than by the absence of a no-connect
+        declaration. `Pin.no_connect()` and `Pin.connect_to_net()` already refuse
+        to let a pin be both (core/pin.py), so "this pin has a net" is proof the
+        marker is stale. The weaker rule ("not listed as no-connect, therefore
+        remove") would be unsafe here: `_extract_circuit_components` documents
+        that `component._pins` can be unavailable after KiCad processing, and an
+        empty extraction under that rule would silently strip every legitimate
+        marker in the design.
+
+        Args:
+            circuit_comp: Component entry from `_extract_circuit_components`
+            kicad_comp: The matching placed KiCad symbol
+            python_pins: {pin_number: net_name} the Python source declares
+            report: Sync report to track additions/removals
+        """
+        from ..sch_gen.schematic_writer import pin_tip_xy
+
+        collection = getattr(self.schematic, "no_connects", None)
+        if collection is None:
+            logger.debug("Schematic exposes no no-connect collection; skipping")
+            return
+
+        python_no_connects = circuit_comp.get("no_connect_pins") or set()
+        existing = self._no_connect_markers()
+
+        ref = kicad_comp.reference
+
+        # 1. Remove markers for pins the Python source now wires to a net.
+        for pin_num in sorted(python_pins):
+            if pin_num in python_no_connects:
+                # Cannot happen via the public API (core/pin.py guards it);
+                # if it somehow did, keep the marker rather than guess.
+                logger.warning(
+                    "%s pin %s is both wired and marked no_connect; "
+                    "leaving its marker untouched", ref, pin_num,
+                )
+                continue
+            xy = pin_tip_xy(kicad_comp, pin_num)
+            if xy is None:
+                continue
+            marker_uuid = self._find_no_connect_at(existing, xy)
+            if marker_uuid is None:
+                continue
+            collection.remove(marker_uuid)
+            existing = [m for m in existing if m[0] != marker_uuid]
+            report.no_connects_removed.append((ref, pin_num))
+            logger.info(
+                "Removed stale no-connect marker at %s pin %s (%.2f, %.2f)",
+                ref, pin_num, xy[0], xy[1],
+            )
+
+        # 2. Add markers for pins newly marked no_connect() in Python.
+        for pin_num in sorted(python_no_connects):
+            xy = pin_tip_xy(kicad_comp, pin_num)
+            if xy is None:
+                logger.warning(
+                    "no_connect: pin %s not found on %s (%s); skipping marker",
+                    pin_num, ref, kicad_comp.lib_id,
+                )
+                continue
+            if self._find_no_connect_at(existing, xy) is not None:
+                continue
+            element = collection.add(Point(xy[0], xy[1]))
+            existing.append((element.uuid, xy[0], xy[1]))
+            report.no_connects_added.append((ref, pin_num))
+            logger.info(
+                "Added no-connect marker at %s pin %s (%.2f, %.2f)",
+                ref, pin_num, xy[0], xy[1],
+            )
+
+    def _no_connect_markers(self) -> List[Tuple[str, float, float]]:
+        """Live no-connect markers as (uuid, x, y).
+
+        Deliberately reads the `.no_connects` *collection* rather than
+        `schematic._data["no_connects"]`. The two paths differ: generation writes
+        the file straight out of `_data` (see
+        `SchematicWriter._add_no_connect_markers`), but sync ends in
+        `Schematic.save()`, which calls `_sync_no_connects_to_data()` and
+        overwrites `_data["no_connects"]` wholesale from the collection. Editing
+        `_data` here would therefore be silently discarded on save -- confirmed
+        by observing a removal that logged correctly and still round-tripped
+        into the output file.
+        """
+        collection = getattr(self.schematic, "no_connects", None)
+        if collection is None:
+            return []
+        markers = []
+        try:
+            elements = list(collection)
+        except TypeError:
+            # Schematic double without a real collection; nothing to reconcile.
+            logger.debug("no-connect collection is not iterable; skipping")
+            return []
+        for element in elements:
+            try:
+                position = element.position
+                markers.append((element.uuid, float(position.x), float(position.y)))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return markers
+
+    @staticmethod
+    def _find_no_connect_at(
+        markers: List[Tuple[str, float, float]], xy: Tuple[float, float]
+    ) -> Optional[str]:
+        """UUID of the marker sitting on a given pin tip, if any.
+
+        Uses `WIRE_GEOMETRY_TOLERANCE` rather than the looser
+        `PIN_LABEL_DISTANCE_TOLERANCE`: this is an exact incidence test between
+        two coordinates computed by the same `pin_tip_xy` helper, not a
+        proximity search, so a near-miss means a *different* pin, not this one.
+        """
+        for marker_uuid, mx, my in markers:
+            if (
+                abs(mx - xy[0]) <= WIRE_GEOMETRY_TOLERANCE
+                and abs(my - xy[1]) <= WIRE_GEOMETRY_TOLERANCE
+            ):
+                return marker_uuid
+        return None
+
     def _reconcile_pin_connections(
         self,
         circuit_components: Dict,
@@ -1486,12 +1715,20 @@ class APISynchronizer:
         # Determine library ID from component type
         lib_id = self._determine_library_id(comp_data)
 
+        # PlacementStrategy.AUTO, stated explicitly. This call previously passed
+        # the bare string "edge_right", which matches no PlacementStrategy member,
+        # so `find_position()` fell through its else branch to AUTO anyway -- the
+        # "right edge" intent has never actually run. AUTO is also the better of
+        # the two here and the one to keep: `_find_edge_position()` does no
+        # collision detection at all and would space every new component 5.08mm
+        # apart on a single row, overlapping them. Named explicitly so the next
+        # reader is not misled by a directive that silently does nothing.
         component = self.component_manager.add_component(
             library_id=lib_id,
             reference=comp_data["reference"],
             value=comp_data["value"],
             footprint=comp_data.get("footprint"),
-            placement_strategy="edge_right",  # Place new components on right edge
+            placement_strategy=PlacementStrategy.AUTO,
         )
 
         if component:
