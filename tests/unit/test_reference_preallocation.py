@@ -219,6 +219,65 @@ def test_auto_named_net_with_shifted_counter_value_still_matches():
     assert matches == {"r_new": "R5"}
 
 
+def test_differing_value_component_not_confused_with_duplicate_bank_after_deletion():
+    """wayfinder #60 (component-deletion verification): a same-nets-
+    different-value component (e.g. a standalone bulk cap sharing a
+    decoupling bank's rail/GND nets) must never be swept into that bank's
+    duplicate-connectivity group.
+
+    Before this fix, `compute_signature()` ignored `value` entirely, so an
+    8-member 100nF bank (`_decouple()`) plus one unrelated standalone 4.7uF
+    cap on the exact same two NAMED nets (RAIL/GND -- not auto-named, so
+    `_resolve_net_token` returns a bare `("NET", name)` token with no value
+    information) all collapsed into ONE duplicate-connectivity bucket.
+    Deleting one bank member (Python side: 7 bank + 1 standalone, in
+    declaration order) then let the ordinal tiebreak pair the *standalone*
+    cap's new-side record against an *old bank member's* reference, purely
+    because it was next in bucket-consumption order -- not because they're
+    the same physical part. That matched (same-ref) pair then goes through
+    `_process_matches`/`_needs_update()` in synchronizer.py, which silently
+    overwrites the old bank member's on-disk value with the standalone
+    cap's value (position/footprint/UUID untouched, so nothing else flags
+    it), while the real old standalone-cap reference is left unmatched --
+    headed for spurious removal.
+
+    Reproduced against a sandboxed copy of the real acquisition_mcu board's
+    MCU sheet (`_decouple("C_MCU", v3v3_u1, gnd, 8)` -> `7`, mirroring
+    acquisition.py:699 next to the standalone `_C("C", "4.7uF", v3v3_u1,
+    gnd)` at acquisition.py:700): incremental sync relabeled two live
+    components' values (C11 100nF->4.7uF, C12 4.7uF->100nF) at their
+    original, otherwise-untouched positions.
+    """
+    existing = [
+        ComponentRecord(identity=f"C{i}", prefix="C", value="100nF", pins={"1": "RAIL", "2": "GND"})
+        for i in range(1, 9)  # C1..C8: 8-member bank
+    ] + [
+        ComponentRecord(identity="C9", prefix="C", value="4.7uF", pins={"1": "RAIL", "2": "GND"}),
+    ]
+    # Python side after deleting ONE bank member: 7 bank members (same
+    # declaration order the real _decouple() loop uses) followed by the
+    # untouched standalone 4.7uF cap -- matching acquisition.py's own
+    # call order (_decouple() runs, then the standalone _C() call).
+    new = [
+        ComponentRecord(identity=f"new_bank_{i}", prefix="C", value="100nF", pins={"1": "RAIL", "2": "GND"})
+        for i in range(7)
+    ] + [
+        ComponentRecord(identity="new_bulk", prefix="C", value="4.7uF", pins={"1": "RAIL", "2": "GND"}),
+    ]
+    existing_map = build_global_net_map(existing)
+    new_map = build_global_net_map(new)
+    matches = match_sheet_prefix_group(new, existing, new_map, existing_map)
+
+    assert matches.get("new_bulk") == "C9", (
+        f"standalone 4.7uF cap matched {matches.get('new_bulk')!r} instead of its own "
+        f"old reference 'C9' -- confused with the 100nF bank (wayfinder #60 regression)"
+    )
+    bank_matches = {matches[f"new_bank_{i}"] for i in range(7)}
+    assert "C9" not in bank_matches, "a bank member claimed the standalone cap's old reference"
+    assert bank_matches <= {f"C{i}" for i in range(1, 9)}
+    assert len(bank_matches) == 7, "bank members must match 7 distinct old references"
+
+
 def test_no_connect_pin_matches_no_connect_pin():
     existing = [
         ComponentRecord(identity="U1", prefix="U", value="MCU", pins={"1": "GND", "2": None}),

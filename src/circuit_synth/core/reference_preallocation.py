@@ -201,7 +201,38 @@ def compute_signature(
     global_net_map: Dict[str, List[PinRecord]],
 ) -> Tuple:
     """Deterministic, order-independent connectivity signature for one
-    component: a sorted tuple of (pin_id, resolved_net_token)."""
+    component: the component's value plus a sorted tuple of
+    (pin_id, resolved_net_token) pairs.
+
+    Value is part of the signature (wayfinder #60). Two components can
+    share byte-identical pin/net topology while being genuinely different
+    parts -- the concrete case found in this codebase's consuming project:
+    an 8-member 100nF decoupling bank (`_decouple()`) sharing its rail/GND
+    nets with one unrelated standalone 4.7uF bulk cap (`_C("C", "4.7uF",
+    rail, gnd)`), all 9 wired to the exact same two NAMED (not auto-named)
+    nets. Before this fix, `_resolve_net_token` returns a bare `("NET",
+    name)` token for a named net regardless of value, so all 9 components
+    landed in ONE duplicate-connectivity bucket together. Deleting one bank
+    member (dropping the Python side to 8 total: 7 bank + 1 standalone) then
+    let `match_sheet_prefix_group`'s ordinal tiebreak pair the *standalone*
+    4.7uF cap against an *old bank member's* reference -- same bucket,
+    consumed in position order, no value check to stop it. The matched
+    (same-ref) pair then went through `_process_matches`/`_needs_update()`,
+    which silently overwrote the old 100nF bank member's on-disk value to
+    4.7uF (position/footprint/UUID unchanged, so nothing else caught it),
+    while the real old 4.7uF component's reference was left unmatched --
+    headed for spurious removal by `_process_unmatched()`. Reproduced and
+    confirmed against a sandboxed copy of the real `acquisition_mcu` board's
+    MCU sheet (`_decouple("C_MCU", v3v3_u1, gnd, 8)` -> `7`): incremental
+    sync silently relabeled two live components' values (C11 100nF->4.7uF,
+    C12 4.7uF->100nF) at their original positions.
+
+    Including value in the signature keeps genuinely-identical duplicates
+    (e.g. four parallel 0R AGND/DGND ties, all value "0") in one bucket
+    exactly as before -- see the module docstring's "Duplicate-connectivity
+    tiebreak" section -- while correctly splitting a same-nets-different-
+    value component into its own, unambiguous bucket.
+    """
     tokens = [
         (
             str(pin_id),
@@ -209,7 +240,7 @@ def compute_signature(
         )
         for pin_id, net_name in rec.pins.items()
     ]
-    return tuple(sorted(tokens))
+    return (("__value__", rec.value or ""),) + tuple(sorted(tokens))
 
 
 def match_sheet_prefix_group(

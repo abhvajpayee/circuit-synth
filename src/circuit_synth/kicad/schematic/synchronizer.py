@@ -684,13 +684,31 @@ class APISynchronizer:
                 no_connects.add(str(pin_num))
         return no_connects
 
-    def _get_pin_labels(self, kicad_component: SchematicSymbol) -> Dict[str, tuple]:
+    def _get_pin_labels(
+        self, kicad_component: SchematicSymbol, include_indirect: bool = True
+    ) -> Dict[str, tuple]:
         """
         Get existing labels at component pins.
+
+        Args:
+            kicad_component: component whose pins to inspect.
+            include_indirect: when False, skip the power-symbol lookup and
+                the wire-graph/rail fallback (wayfinder #61,
+                `_find_marker_via_wires`) -- only a label sitting DIRECTLY on
+                a pin is returned. Used by `_remove_component_pin_labels()`
+                (wayfinder #60) when a component is about to be deleted: a
+                power symbol or a cap_bank()/resistor_bank() shared-rail
+                marker found only via those indirect paths is never owned by
+                this one component (other components/pins still depend on
+                it), so it must never be a candidate for removal just
+                because this component's pin happened to resolve to it.
+                Default True preserves this method's existing behavior for
+                every other caller (pin reconciliation, preallocation).
 
         Returns:
             Dict mapping pin_number -> (Label object, label_type) tuple
             where label_type is either "regular" or "hierarchical"
+            (or "power_symbol" when include_indirect finds one).
         """
         pin_labels = {}
 
@@ -742,7 +760,7 @@ class APISynchronizer:
                         break
 
             # Finally check for power symbols if no label found
-            if str(pin.number) not in pin_labels:
+            if include_indirect and str(pin.number) not in pin_labels:
                 for component in self.schematic.components:
                     # Check if this is a power symbol
                     if component.reference.startswith(POWER_SYMBOL_PREFIX):
@@ -759,12 +777,177 @@ class APISynchronizer:
             # Last resort: the pin may carry no marker of its own at all, and
             # instead be wired into a shared RAIL. Resolve it through the wire
             # graph (wayfinder #61) -- see _find_marker_via_wires().
-            if str(pin.number) not in pin_labels:
+            if include_indirect and str(pin.number) not in pin_labels:
                 rail_match = self._find_marker_via_wires(pin_pos)
                 if rail_match is not None:
                     pin_labels[str(pin.number)] = rail_match
 
         return pin_labels
+
+    def _remove_component_pin_labels(
+        self, kicad_comp: "SchematicSymbol", report: "SyncReport"
+    ) -> int:
+        """Strip a component's own directly-placed pin-stub labels before it
+        is deleted (wayfinder #60).
+
+        circuit-synth writes most pin connectivity as a label sitting
+        exactly on the pin's own absolute position, with no separate wire
+        object -- KiCad treats the coincident label and pin as connected by
+        position alone. `ComponentManager.remove_component()` only removes
+        the component's `(symbol ...)` element; it never touches those
+        coincident label objects, since nothing else in the schematic model
+        records that a given label "belongs to" a given component's pin.
+        Left behind, they become genuinely disconnected (no pin, no wire)
+        and are correctly flagged by `kicad-cli sch erc` as
+        `label_dangling` on every subsequent run -- confirmed against a real
+        deleted component (a standalone front-panel LED + its series
+        resistor) in a sandboxed incremental-sync run: ERC went from 137
+        (clean regen baseline, component absent from the start) to 140,
+        exactly 3 extra `label_dangling` findings for the 2 net-stub labels
+        the deleted pair's 3 wired pins had left coincident with nothing.
+
+        Deliberately calls `_get_pin_labels(kicad_comp, include_indirect=False)`
+        -- see that flag's docstring. A power symbol or a shared bank-rail
+        marker resolved only through the indirect (power-symbol / wire-graph
+        rail) paths is never private to this one component; removing it here
+        would corrupt connectivity for every other component still using it
+        (exactly the risk wayfinder #60 flagged for cap_bank()/
+        resistor_bank() members). Only a label found directly on the pin --
+        which by construction cannot be any other pin's marker too -- is
+        safe to remove on this component's behalf.
+        """
+        direct_labels = self._get_pin_labels(kicad_comp, include_indirect=False)
+        removed = 0
+        for pin_num, (label, label_type) in direct_labels.items():
+            if self._remove_pin_label(
+                label, kicad_comp.reference, pin_num, report, label_type
+            ):
+                removed += 1
+        return removed
+
+    def _remove_component_orphaned_power_symbols(
+        self, kicad_comp: "SchematicSymbol", report: "SyncReport"
+    ) -> int:
+        """Remove `#PWR*` symbols that sat directly on THIS component's own
+        pins and are left with nothing else anchored to them, right before
+        the component itself is deleted (wayfinder #60).
+
+        `_process_unmatched()` unconditionally preserves every `#PWR*`
+        component regardless of what happened elsewhere in this sync pass
+        ("Always preserve power symbols - they're auto-generated from power
+        nets") -- correct for the common case, where a rail's power flag is
+        directly on, or shared by, several surviving components' pins. But
+        when the deleted component was the ONLY thing ever anchored to that
+        specific power-symbol instance (e.g. a component that was the sole
+        user of a low-fanout net, rather than a shared board-wide rail like
+        +3V3/GND), the old flag is left an island: nothing else in the
+        schematic sits at its position, and `kicad-cli sch erc` correctly
+        reports it `pin_not_connected`. Reproduced with a minimal 3-
+        component circuit (J1 + a standalone R+LED pair on private VCC/GND
+        net instances, each getting its own un-shared power-symbol
+        instance) -- not reproduced on the real, densely-populated
+        acquisition_mcu board, where +3V3/GND are directly shared by
+        hundreds of other pins, so this is a narrower edge case than the
+        pin-stub-label bug above, but the same root shape: a graphical
+        marker at a deleted component's old pin position that nothing
+        removes.
+
+        Deliberately scoped to power symbols sitting directly on THIS
+        component's own pins -- NOT a global "any #PWR symbol with no
+        coincident pin anywhere" sweep. An earlier version of this fix did
+        exactly that as a single end-of-sync pass and broke
+        `test_power_symbol_preservation`: that test (a real, pre-existing,
+        intentional use case) manually adds a `#PWR` symbol at an arbitrary
+        position never coincident with ANY component's pin, specifically to
+        verify such symbols survive a sync untouched -- KiCad users
+        routinely place a free-floating power flag purely to satisfy ERC's
+        `power_pin_not_driven` on a rail, with no single pin "owning" it.
+        Scoping to "was this power symbol sitting on one of the pins I am
+        *right now* deleting" correctly leaves that pattern alone: a
+        symbol that was never coincident with any pin -- deleted or
+        surviving -- is never a candidate here at all.
+
+        Gated on `not self.preserve_user_components` by the caller: a
+        caller who explicitly asked to keep everything not in Python
+        (`preserve_user_components=True`) should have that request
+        respected for power symbols too, not silently overridden.
+        """
+        symbol_cache = get_symbol_cache()
+        symbol_def = symbol_cache.get_symbol(kicad_comp.lib_id)
+        if not symbol_def or not hasattr(symbol_def, "pins"):
+            return 0
+
+        from .geometry_utils import GeometryUtils
+
+        def _pin_positions(comp) -> List[Tuple[float, float]]:
+            sdef = symbol_cache.get_symbol(comp.lib_id)
+            if not sdef or not hasattr(sdef, "pins"):
+                return []
+            positions = []
+            for pin in sdef.pins:
+                pin_position = pin.position if hasattr(pin, "position") else Point(0, 0)
+                pin_dict = {
+                    "x": float(pin_position.x),
+                    "y": float(pin_position.y),
+                    "orientation": float(pin.rotation if hasattr(pin, "rotation") else 0.0),
+                }
+                pin_pos, _ = GeometryUtils.calculate_pin_label_position_from_dict(
+                    pin_dict=pin_dict,
+                    component_position=comp.position,
+                    component_rotation=comp.rotation,
+                )
+                positions.append((float(pin_pos.x), float(pin_pos.y)))
+            return positions
+
+        deleted_ref = kicad_comp.reference
+        own_pin_positions = _pin_positions(kicad_comp)
+        if not own_pin_positions:
+            return 0
+
+        # Candidates: #PWR* components sitting directly on one of THIS
+        # component's own pins.
+        candidates = []
+        for comp in self.schematic.components:
+            ref = getattr(comp, "reference", "")
+            if not ref.startswith(POWER_SYMBOL_PREFIX):
+                continue
+            px, py = float(comp.position.x), float(comp.position.y)
+            if any(
+                math.sqrt((px - ox) ** 2 + (py - oy) ** 2) < PIN_LABEL_DISTANCE_TOLERANCE
+                for ox, oy in own_pin_positions
+            ):
+                candidates.append(comp)
+        if not candidates:
+            return 0
+
+        removed = 0
+        for pwr in candidates:
+            px, py = float(pwr.position.x), float(pwr.position.y)
+            still_used = False
+            for comp in self.schematic.components:
+                ref = getattr(comp, "reference", "")
+                if not ref or ref.startswith(POWER_SYMBOL_PREFIX) or ref == deleted_ref:
+                    continue
+                if any(
+                    math.sqrt((px - ox) ** 2 + (py - oy) ** 2) < PIN_LABEL_DISTANCE_TOLERANCE
+                    for ox, oy in _pin_positions(comp)
+                ):
+                    still_used = True
+                    break
+            if still_used:
+                continue
+            pwr_ref = pwr.reference
+            if self.component_manager.remove_component(pwr_ref):
+                removed += 1
+                report.removed.append(pwr_ref)
+                if pwr_ref in report.preserved:
+                    report.preserved.remove(pwr_ref)
+                logger.info(
+                    "Removed orphaned power symbol %s at (%.2f, %.2f) -- "
+                    "was only anchored to deleted component %s (wayfinder #60)",
+                    pwr_ref, px, py, deleted_ref,
+                )
+        return removed
 
     # ------------------------------------------------------------------
     # Rail (wire-graph) connectivity resolution -- wayfinder #61
@@ -1793,6 +1976,36 @@ class APISynchronizer:
                 report.preserved.append(kicad_ref)
             else:
                 logger.info(f"      -> REMOVING (preserve_user_components=False)")
+                # wayfinder #60: strip this component's own directly-placed
+                # pin-stub labels BEFORE removing its symbol, or they become
+                # orphaned (label_dangling on every later ERC run). Must run
+                # while kicad_comp is still a live, positioned symbol --
+                # _get_pin_labels() needs its position/rotation to compute
+                # pin locations.
+                #
+                # NOTE: a sibling _remove_component_pin_wires() was
+                # prototyped alongside this (removing wire STUBS the same
+                # way, for cap_bank()/resistor_bank() members) but reverted
+                # -- confirmed unsafe. cap_bank()'s shared rail appears to
+                # be drawn as a CHAIN of short simple 2-point wire segments
+                # between adjacent members' tap points, not one continuous
+                # multi-point polyline, so "remove any simple wire with an
+                # endpoint at this pin's position" cannot structurally
+                # distinguish a private per-member stub from a legitimate
+                # rail-link segment shared with a still-surviving neighbor.
+                # Verified unsafe empirically: deleting a MIDDLE bank member
+                # (C8 of C1..C9) with that logic active broke connectivity
+                # for its still-alive neighbors (6 new pin_not_connected +
+                # 1 new label_dangling + 14 compensating label rewrites,
+                # strictly worse than doing nothing). Not reproduced on the
+                # real acquisition_mcu board in two direct sandboxed tests
+                # (a standalone-component deletion and a real 8->7 C_MCU
+                # decoupling-bank deletion), both ERC-byte-identical to a
+                # clean-regen baseline -- left as a documented, open gap
+                # rather than shipping an unsafe fix for an unreproduced-
+                # on-the-real-board edge case. See wayfinder #60 report.
+                self._remove_component_pin_labels(kicad_comp, report)
+                self._remove_component_orphaned_power_symbols(kicad_comp, report)
                 self.component_manager.remove_component(kicad_ref)
                 report.removed.append(kicad_ref)
 
