@@ -470,6 +470,38 @@ class SchematicGenerator:
             logger.info("⚠️  preserve_user_components=True: Components in KiCad but not in Python will be kept")
 
         if has_subcircuits:
+            # Wayfinder #67: incremental sync learns "which sheets exist"
+            # exclusively from disk (HierarchicalSynchronizer._build_hierarchy
+            # parses the root .kicad_sch and recurses through its (sheet ...)
+            # blocks), so a @circuit function that has never been generated is
+            # absent from that tree and never visited. Moving a component into
+            # such a sheet therefore removed it from its OLD sheet (the correct
+            # deletion path, wayfinder #60) with nothing anywhere to add it
+            # back -- a silent delete, not an error and not a no-op. Create any
+            # Python-only sheet HERE, before the synchronizer is constructed,
+            # so every later stage sees an ordinary existing sheet: hierarchy
+            # discovery below, per-sheet component sync, reconcile_sheet_pins()
+            # (which owns the new sheet symbol's pins and tie labels), and
+            # fix_sheet_symbol_sizes(). Raises rather than guesses on a
+            # re-parent -- see new_sheet_sync.py's module docstring.
+            from circuit_synth.kicad.schematic.new_sheet_sync import (
+                create_missing_sheets,
+            )
+
+            new_sheet_changes = create_missing_sheets(
+                self,
+                top_circuit,
+                sub_dict,
+                existing_references=self._collect_all_references(json_file),
+            )
+            if new_sheet_changes:
+                logger.info(
+                    f"📄 Created {len(new_sheet_changes)} new sheet artifact(s) "
+                    f"present in Python but not yet in KiCad:"
+                )
+                for change in new_sheet_changes:
+                    logger.info(f"   {change}")
+
             # Use hierarchical synchronizer for projects with subcircuits
             logger.info(
                 f"Detected hierarchical project with {len(sub_dict)} subcircuits"
@@ -1798,7 +1830,9 @@ class SchematicGenerator:
                     # Parse UUID from schematic
                     import re
 
-                    uuid_match = re.search(r"\(uuid\s+([a-f0-9-]+)\)", content)
+                    # Quotes optional -- see the identical fix on the
+                    # subcircuit branch below (wayfinder #67).
+                    uuid_match = re.search(r'\(uuid\s+"?([a-f0-9-]+)"?\s*\)', content)
                     if uuid_match:
                         sheets.append([uuid_match.group(1), ""])
                     else:
@@ -1828,7 +1862,18 @@ class SchematicGenerator:
                             # Parse UUID from schematic
                             import re
 
-                            uuid_match = re.search(r"\(uuid\s+([a-f0-9-]+)\)", content)
+                            # Quotes are optional: this generator (and KiCad
+                            # itself since 20250114) writes (uuid "abc-123"),
+                            # but the unquoted form appears in older files.
+                            # Without the optional quotes this only ever fell
+                            # through to the filename fallback below, which
+                            # writes an entry KiCad cannot resolve to a sheet
+                            # -- found via wayfinder #67, whose incremental
+                            # path is the first caller to reach this branch
+                            # (clean generation always passes sheet_uuids).
+                            uuid_match = re.search(
+                                r'\(uuid\s+"?([a-f0-9-]+)"?\s*\)', content
+                            )
                             if uuid_match:
                                 sheets.append([uuid_match.group(1), c_name])
                             else:

@@ -666,3 +666,78 @@ def test_no_change_file_not_rewritten(tmp_path: Path) -> None:
     content_before = sub.read_text()
     fix_subsheet_labels(str(tmp_path / "top.kicad_sch"))
     assert sub.read_text() == content_before
+
+
+# ---------------------------------------------------------------------------
+# fix_sheet_symbol_sizes — per-pin tie-label identity (wayfinder #67)
+# ---------------------------------------------------------------------------
+
+def _sheet_at(
+    sx: float, sy: float, filename: str, pins: list[str], width: float = _W
+) -> str:
+    """A sheet block at an arbitrary origin, all pins on its right edge --
+    the shape sheet_pin_sync.reconcile_sheet_pins() produces for a
+    freshly-created sheet symbol."""
+    body = (
+        '\t(sheet\n'
+        f'\t\t(at {sx:.4f} {sy:.4f})\n'
+        f'\t\t(size {width:.4f} {_OLD_H:.4f})\n'
+        f'\t\t(property "Sheetfile" "{filename}"\n'
+        f'\t\t\t(at {sx:.4f} {sy + _OLD_H + 0.7116:.4f} 0)\n'
+        '\t\t)\n'
+    )
+    for k, name in enumerate(pins):
+        body += _pin_block(name, sx + width, sy + 2.54 + k * 2.54, angle=0)
+    body += '\t)\n'
+    return body
+
+
+def test_sheet_symbols_sharing_an_edge_keep_their_own_tie_labels(tmp_path: Path) -> None:
+    """Wayfinder #67 regression: two sheet symbols stacked in a column (same
+    x, therefore the same left AND right edge) that each expose a pin with
+    the SAME name must each keep their own coincident tie label.
+
+    The label-repositioning lookup used to be keyed on (x, pin_name) alone,
+    which is not unique across sheets sharing an edge -- the last sheet
+    scanned overwrote the others, and every same-named tie label on the
+    canvas was relocated onto that one sheet's pin. Real symptom on the
+    acquisition Analog+Power board: four freshly-created LDO_* sheet symbols
+    each with an "AGND" pin left three of the four sheet pins with no
+    coincident tie (`pin_not_connected`) plus a stranded label
+    (`label_dangling`).
+
+    Both sheets here have 2 pins, so n_left=1: the FIRST pin (alphabetically
+    "AGND") moves to the left edge, the second stays on the right.
+    """
+    sx, sy_a, sy_b = 10.0, 10.0, 60.0
+    text = (
+        '(kicad_sch (version 20211123) (generator circuit_synth)\n'
+        + _sheet_at(sx, sy_a, "ldo_a.kicad_sch", ["AGND", "VOUT_A"])
+        + _sheet_at(sx, sy_b, "ldo_b.kicad_sch", ["AGND", "VOUT_B"])
+        # Each sheet's own AGND tie label, coincident with its own pin.
+        + _hl("AGND", sx + _W, sy_a + 2.54, angle=0.0)
+        + _hl("AGND", sx + _W, sy_b + 2.54, angle=0.0)
+        + ')\n'
+    )
+    sch = tmp_path / "top.kicad_sch"
+    sch.write_text(text)
+    fix_sheet_symbol_sizes(str(sch))
+    out = sch.read_text()
+
+    # Both AGND pins move to their own sheet's LEFT edge, first slot.
+    expected = {
+        (sx, sy_a + 2.54),
+        (sx, sy_b + 2.54),
+    }
+    agnd_labels = {
+        (round(float(m.group(1)), 4), round(float(m.group(2)), 4))
+        for m in re.finditer(
+            r'\(hierarchical_label "AGND"\n\t\t\(shape input\)\n\t\t'
+            r'\(at ([\d.+-]+) ([\d.+-]+)',
+            out,
+        )
+    }
+    assert agnd_labels == expected, (
+        f"AGND tie labels collapsed onto one sheet instead of tracking their "
+        f"own pins: got {sorted(agnd_labels)}, expected {sorted(expected)}"
+    )

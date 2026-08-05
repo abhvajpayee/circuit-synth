@@ -70,10 +70,42 @@ def fix_sheet_symbol_sizes(sch_path: str) -> None:
     LABEL_OFFSET = 0.7116  # KiCad 1/36-inch offset for Sheetfile label
 
     # ---- Pass 1: scan every sheet block ----
-    # label_updates[(old_right_x, pin_name)] = (new_x, new_y, new_angle)
-    # sheet_rewrites[block_start_line]       = (block_end_line, new_block_text)
+    # label_updates[(old_x, pin_name)]                = (new_x, new_y, new_angle)
+    # label_updates_exact[(old_x, old_y, pin_name)]   = (new_x, new_y, new_angle)
+    # sheet_rewrites[block_start_line]                = (block_end_line, new_block_text)
+    #
+    # Two lookups, because the (x, name) key alone is NOT unique: it
+    # identifies a pin only when no two sheet symbols on this canvas share
+    # both a vertical edge and a pin name. Clean generation happens to avoid
+    # that (text-flow placement gives each sheet its own x), but wayfinder
+    # #67's incremental sheet creation stacks new sheet symbols in a column
+    # at one x -- so four freshly-created LDO_* sheet symbols each carrying
+    # an "AGND" pin all collided on the single key (58.42, "AGND"), the last
+    # one scanned overwriting the rest. Every AGND tie label on the canvas
+    # was then relocated onto that ONE sheet's pin, leaving the other three
+    # sheet pins with no coincident tie (kicad-cli sch erc:
+    # pin_not_connected) and one label stranded (label_dangling).
+    #
+    # The exact key adds the pin's own current y, which does identify a
+    # single pin. The old (x, name) key is kept as a fallback for the case it
+    # was introduced for (wayfinder #6: a tie label frozen at the sheet's
+    # other edge from an earlier run, so its y may not match the pin's
+    # current y either) -- but only when that key is UNAMBIGUOUS, i.e. it was
+    # registered by exactly one pin. A guessing fallback is what produced the
+    # wrong-sheet relocation above; leaving an ambiguous label untouched is
+    # strictly safer than moving it somewhere provably arbitrary.
     label_updates:  dict[tuple[float, str], tuple[float, float, int]] = {}
+    label_updates_exact: dict[tuple[float, float, str], tuple[float, float, int]] = {}
+    ambiguous_keys: set[tuple[float, str]] = set()
     sheet_rewrites: dict[int, tuple[int, str]] = {}
+
+    def _register(kx: float, ky: float | None, name: str, target) -> None:
+        if ky is not None:
+            label_updates_exact[(round(kx, 4), round(ky, 4), name)] = target
+        key = (kx, name)
+        if key in label_updates and label_updates[key] != target:
+            ambiguous_keys.add(key)
+        label_updates[key] = target
 
     i = 0
     while i < len(lines):
@@ -99,9 +131,24 @@ def fix_sheet_symbol_sizes(sch_path: str) -> None:
         cur_w = float(size_m.group(1))
         old_right_x = sx + cur_w
 
+        # Each pin's name AND its own CURRENT position -- the position is
+        # what makes a pin (and therefore its coincident tie label)
+        # individually identifiable across sheet symbols that share an edge.
+        pin_entries: list[tuple[str, float | None, float | None]] = []
+        for pin_m in re.finditer(
+            r'\t\t\(pin\s+"([^"]+)"[^\n]*\n(?:[^\n]*\n)*?\t\t\t\(at\s+([\d.+-]+)\s+([\d.+-]+)',
+            raw,
+        ):
+            pin_entries.append(
+                (pin_m.group(1), float(pin_m.group(2)), float(pin_m.group(3)))
+            )
         pin_names = re.findall(r'\t\t\(pin\s+"([^"]+)"', raw)
         n = len(pin_names)
         if n == 0: continue
+        # Fall back to name-only registration if the position scan didn't
+        # line up one-to-one (malformed or unexpected block layout).
+        if len(pin_entries) != n or [e[0] for e in pin_entries] != pin_names:
+            pin_entries = [(name, None, None) for name in pin_names]
 
         n_left = math.ceil(n / 2)   # left side always >= right side
         raw_h  = MARGIN_TOP + (n_left - 1) * PIN_PITCH + MARGIN_BOT
@@ -122,14 +169,18 @@ def fix_sheet_symbol_sizes(sch_path: str) -> None:
         # itself is now on the RIGHT -- with only old_right_x registered, the
         # label was never found and the net was effectively disconnected on
         # the root sheet (no coincident tie at the pin's real position).
-        for k, name in enumerate(pin_names[:n_left]):
+        for k, (name, px, py) in enumerate(pin_entries[:n_left]):
             target = (sx, sy + MARGIN_TOP + k * PIN_PITCH, 180)
-            label_updates[(old_right_x, name)] = target
-            label_updates[(sx, name)] = target
-        for k, name in enumerate(pin_names[n_left:]):
+            if px is not None:
+                _register(px, py, name, target)
+            _register(old_right_x, py, name, target)
+            _register(sx, py, name, target)
+        for k, (name, px, py) in enumerate(pin_entries[n_left:]):
             target = (sx + cur_w, sy + MARGIN_TOP + k * PIN_PITCH, 0)
-            label_updates[(old_right_x, name)] = target
-            label_updates[(sx, name)] = target
+            if px is not None:
+                _register(px, py, name, target)
+            _register(old_right_x, py, name, target)
+            _register(sx, py, name, target)
 
         # Rewrite sheet block
         new_sheetfile_y = sy + new_h + LABEL_OFFSET
@@ -200,6 +251,27 @@ def fix_sheet_symbol_sizes(sch_path: str) -> None:
 
         sheet_rewrites[block_start] = (block_end, ''.join(new_block))
 
+    def _lookup(name, at_x, at_y):
+        """Find the repositioning target for a tie label at (at_x, at_y).
+
+        Exact (x, y, name) first -- that identifies one specific sheet pin.
+        Only if nothing matches exactly does this fall back to the looser
+        (x, name) key (wayfinder #6's stale-edge case), and then only when
+        that key is unambiguous; an ambiguous one means two or more sheet
+        symbols on this canvas share an edge and a pin name, and guessing
+        between them is what wayfinder #67 had to undo.
+        """
+        if name is None or at_x is None:
+            return None
+        if at_y is not None:
+            for (kx, ky, kn), v in label_updates_exact.items():
+                if kn == name and abs(kx - at_x) < 0.01 and abs(ky - at_y) < 0.01:
+                    return v
+        for (kx, kn), v in label_updates.items():
+            if kn == name and abs(kx - at_x) < 0.01:
+                return None if (kx, kn) in ambiguous_keys else v
+        return None
+
     # ---- Pass 2: rebuild the file ----
     out: list[str] = []
     i = 0
@@ -232,11 +304,7 @@ def fix_sheet_symbol_sizes(sch_path: str) -> None:
                     at_x, at_y, at_angle = float(m.group(1)), float(m.group(2)), float(m.group(3))
                     break
 
-            update = None
-            if hl_name is not None and at_x is not None:
-                for (kx, kn), v in label_updates.items():
-                    if kn == hl_name and abs(kx - at_x) < 0.01:
-                        update = v; break
+            update = _lookup(hl_name, at_x, at_y)
 
             final_x     = update[0] if update else (at_x or 0.0)
             final_y     = update[1] if update else (at_y or 0.0)
@@ -283,11 +351,7 @@ def fix_sheet_symbol_sizes(sch_path: str) -> None:
                     at_x, at_y, at_angle = float(m.group(1)), float(m.group(2)), float(m.group(3))
                     break
 
-            update = None
-            if lbl_name is not None and at_x is not None:
-                for (kx, kn), v in label_updates.items():
-                    if kn == lbl_name and abs(kx - at_x) < 0.01:
-                        update = v; break
+            update = _lookup(lbl_name, at_x, at_y)
 
             if update is not None:
                 final_x, final_y, final_angle = update[0], update[1], float(update[2])

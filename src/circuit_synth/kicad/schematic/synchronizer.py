@@ -818,11 +818,153 @@ class APISynchronizer:
         """
         direct_labels = self._get_pin_labels(kicad_comp, include_indirect=False)
         removed = 0
+        removed_marks = []  # (text, x, y) of each label actually removed
         for pin_num, (label, label_type) in direct_labels.items():
+            text = getattr(label, "text", None)
+            pos = getattr(label, "position", None)
             if self._remove_pin_label(
                 label, kicad_comp.reference, pin_num, report, label_type
             ):
                 removed += 1
+                if text is not None and pos is not None:
+                    removed_marks.append((text, float(pos.x), float(pos.y)))
+
+        removed += self._remove_stacked_duplicate_labels(
+            kicad_comp.reference, report, removed_marks
+        )
+        return removed
+
+    def _remove_stacked_duplicate_labels(
+        self,
+        deleted_ref: str,
+        report: "SyncReport",
+        removed_marks: List[Tuple[str, float, float]],
+    ) -> int:
+        """Remove labels left STACKED at the exact position, with the exact
+        text, of a label this deletion already removed (wayfinder #67).
+
+        `_get_pin_labels()` returns at most one label per pin -- it `break`s
+        on the first match within tolerance -- and it is keyed by PIN, so
+        when two of a component's pins resolve to the same absolute
+        coordinate (circuit-synth writes one label per pin CONNECTION, so a
+        part with several pins on one net, e.g. LT3045's IN/IN/EN-UV all on
+        the gated input rail, really does end up with identical labels
+        stacked at one point) both pins map to the SAME first-found label
+        object. The duplicate underneath is never a candidate and survives
+        the deletion as a dangling label -- observed on the real board
+        during wayfinder #67's LDO split: one `INT_P14V0_GATED_U34` of a
+        coincident pair stayed on Power, reported `label_dangling` by
+        `kicad-cli sch erc` on every subsequent run.
+
+        Scoped to EXACT duplicates (same text, same point, within
+        `WIRE_GEOMETRY_TOLERANCE`) of something already removed, not to
+        "any label near a deleted pin". That distinction is load-bearing:
+        the broader position sweep was tried first and regressed the real
+        board badly (26 -> 76 ERC violations, +34 `unconnected_wire_endpoint`
+        and +8 `isolated_pin_label`), because a label at a deleted pin's
+        position can also be the anchor a `cap_bank()`/`resistor_bank()`
+        shared rail wires to -- exactly the hazard wayfinder #60 called out
+        when it chose `include_indirect=False`. An exact stacked duplicate
+        carries no such risk: KiCad resolves coincident same-text labels to
+        one connection point, so whatever still depends on that point was
+        already losing it when the first of the pair was removed.
+        """
+        if not removed_marks:
+            return 0
+
+        def _is_duplicate(label) -> bool:
+            text = getattr(label, "text", None)
+            pos = getattr(label, "position", None)
+            if text is None or pos is None:
+                return False
+            for mark_text, mx, my in removed_marks:
+                if (
+                    text == mark_text
+                    and abs(float(pos.x) - mx) <= WIRE_GEOMETRY_TOLERANCE
+                    and abs(float(pos.y) - my) <= WIRE_GEOMETRY_TOLERANCE
+                ):
+                    return True
+            return False
+
+        removed = 0
+        for label_type, collection in (
+            ("regular", list(self.schematic.labels)),
+            ("hierarchical", list(self.schematic.hierarchical_labels)),
+        ):
+            for label in collection:
+                if not _is_duplicate(label):
+                    continue
+                if self._remove_pin_label(
+                    label, deleted_ref, "?", report, label_type
+                ):
+                    removed += 1
+        return removed
+
+    def _remove_component_no_connects(
+        self, kicad_comp: "SchematicSymbol", report: "SyncReport"
+    ) -> int:
+        """Remove `(no_connect ...)` markers sitting on a component's own
+        pins, right before the component is deleted (wayfinder #67).
+
+        `Pin.no_connect()` makes the generator emit a real KiCad no-connect
+        marker at the pin's tip. Nothing removed those markers when their
+        component went away: `ComponentManager.remove_component()` only
+        removes the `(symbol ...)` element, and the no-connect reconciliation
+        added by wayfinder #64 only ever visits MATCHED components' pins, so
+        a marker whose component no longer exists in Python is never
+        considered at all. Left behind, it is a marker attached to nothing --
+        `kicad-cli sch erc` reports `no_connect_dangling`.
+
+        Surfaced by wayfinder #67's real-board run: moving the LT3045 (whose
+        PG pin carries `Pin.no_connect()`) into a new LDO_12V0 sheet left its
+        old marker stranded on Power. Same shape as the pin-label and
+        power-symbol orphans wayfinder #60 fixed -- a graphical marker at a
+        deleted component's old pin position that nothing removes.
+
+        Scoped exactly like those: only a marker coincident with one of THIS
+        component's own pin tips is touched, so a user-placed marker
+        elsewhere on the canvas is never a candidate.
+        """
+        collection = getattr(self.schematic, "no_connects", None)
+        if collection is None:
+            return 0
+
+        markers = self._no_connect_markers()
+        if not markers:
+            return 0
+
+        symbol_cache = get_symbol_cache()
+        symbol_def = symbol_cache.get_symbol(kicad_comp.lib_id)
+        if not symbol_def or not hasattr(symbol_def, "pins"):
+            return 0
+
+        # Same helper generation used to WRITE the marker, so a marker
+        # written by one path is found at the same coordinate by the other.
+        from ..sch_gen.schematic_writer import pin_tip_xy
+
+        removed = 0
+        for pin in symbol_def.pins:
+            tip = pin_tip_xy(kicad_comp, str(pin.number))
+            if tip is None:
+                continue
+            marker_uuid = self._find_no_connect_at(markers, tip)
+            if marker_uuid is None:
+                continue
+            try:
+                if collection.remove(marker_uuid):
+                    removed += 1
+                    markers = [m for m in markers if m[0] != marker_uuid]
+                    report.no_connects_removed.append(
+                        (kicad_comp.reference, str(pin.number))
+                    )
+            except Exception:
+                logger.debug(
+                    "Could not remove no-connect marker %s for deleted %s pin %s",
+                    marker_uuid,
+                    kicad_comp.reference,
+                    pin.number,
+                    exc_info=True,
+                )
         return removed
 
     def _remove_component_orphaned_power_symbols(
@@ -2006,6 +2148,7 @@ class APISynchronizer:
                 # on-the-real-board edge case. See wayfinder #60 report.
                 self._remove_component_pin_labels(kicad_comp, report)
                 self._remove_component_orphaned_power_symbols(kicad_comp, report)
+                self._remove_component_no_connects(kicad_comp, report)
                 self.component_manager.remove_component(kicad_ref)
                 report.removed.append(kicad_ref)
 
