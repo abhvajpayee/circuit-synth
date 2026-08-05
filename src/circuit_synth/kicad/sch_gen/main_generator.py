@@ -503,9 +503,16 @@ class SchematicGenerator:
         # a label at its use site with no matching sheet-symbol pin anywhere
         # up the chain, which ERC reports as unconnected. Reconcile every
         # (parent, child) sheet-symbol edge against what the Python circuit
-        # hierarchy says should cross it -- additive only (never removes a
-        # pin), same conservative philosophy as the rest of incremental
-        # sync. Must run before `_postprocess_schematic()`'s
+        # hierarchy says should cross it -- adds whatever's missing, and
+        # (wayfinder #66) also removes a stale SCALAR pin whose net no
+        # longer crosses that specific, still-existing edge (e.g. an
+        # existing call's net argument got rebound to a different Net --
+        # real example: acquisition.py's power() changing
+        # buck_14v0(v24, ...) to buck_14v0(v24_sw12, ...)). Component/sheet
+        # deletion remains out of scope and untouched -- same conservative
+        # philosophy as the rest of incremental sync for THAT class of
+        # change; see sheet_pin_sync.py's own module docstring for the full
+        # distinction. Must run before `_postprocess_schematic()`'s
         # `fix_subsheet_labels()` pass (called later, from
         # `generate_kicad_project()`), which -- based on this exact pin
         # data -- decides whether an existing hierarchical_label at a

@@ -27,10 +27,31 @@ This module reconciles every existing (parent, child) sheet-symbol edge in
 the already-generated KiCad project against the Python circuit hierarchy's
 own boundary-crossing net set (see `boundary_nets.py`) and adds whatever
 pins -- and, where nothing on the parent's own canvas already represents
-the net, a matching tie label -- are missing. It only ever ADDS: never
-removes a pin/label whose net no longer crosses a boundary, matching this
-project's established "additive only" incremental-sync philosophy (see
-`docs/adr` / wayfinder map #54's notes on unverified deletion scenarios).
+the net, a matching tie label -- are missing.
+
+Wayfinder #66 follow-on: this module now ALSO removes a stale SCALAR sheet
+pin (never a bus-vector pin -- those stay `bus_emit.py`'s own territory,
+same guard as `_covered_by_existing_vector_pin` below) whose net no longer
+crosses this specific, still-existing (parent, child) edge -- e.g. an
+EXISTING call from an EXISTING parent circuit to an EXISTING child circuit
+had one of its net ARGUMENTS REBOUND to a different `Net` object (real
+example: `acquisition.py`'s `power()` changed `buck_14v0(v24, ...)` to
+`buck_14v0(v24_sw12, ...)` when ADR-0027 added a gating eFuse -- same call
+site, same parent/child sheet-symbol edge, just a different Net passed).
+The child's own internal component-pin labels get renamed correctly by
+ordinary per-pin sync, but without this removal step the PARENT's
+sheet-symbol pin list for that child kept the stale old net's pin forever,
+which `kicad-cli sch erc` reports as `hier_label_mismatch` on every future
+sync even though a clean regen of the identical (new) source has no such
+pin at all.
+
+This is narrower than, and does not reopen, the "additive only" caution
+this module's earlier version cited (wayfinder map #54's notes on
+unverified *component*-deletion scenarios): no sheet or component is ever
+removed here, only a single stale scalar pin (plus, if present, its own
+tie label sitting exactly at that pin's old coordinate on the parent's
+canvas) on a (parent, child) edge that itself still exists on both sides.
+Component/sheet deletion remains untouched and out of scope.
 
 Exact pin positions/justify are not load-bearing here: `sch_postprocess.py`'s
 `fix_sheet_symbol_sizes()` always runs immediately afterward (both after a
@@ -141,7 +162,7 @@ def reconcile_sheet_pins(
             )
             continue
 
-        sch = None  # lazily loaded -- avoid touching a file with nothing to add
+        sch = None  # lazily loaded -- avoid touching a file with nothing to add/remove
         modified = False
 
         for child_name in child_names:
@@ -150,9 +171,14 @@ def reconcile_sheet_pins(
                 for n in boundary_nets.subtree_net_names(subcircuits, child_name)
                 if boundary_nets.net_crosses_boundary(subcircuits, child_name, n, owners)
             )
-            if not pin_list:
-                continue
 
+            # #66: unlike the ADD side just below, staleness must be checked
+            # even when pin_list is empty (a child whose subtree stopped
+            # needing ANY crossing net could still have stale pins left over
+            # from before) -- so this can no longer early-`continue` purely
+            # on "nothing to add". Loading is still read-only until
+            # `modified` actually goes True below, so this costs nothing on
+            # the common case where a child's on-disk pins already match.
             if sch is None:
                 sch = ksa.Schematic.load(str(parent_path))
 
@@ -164,17 +190,64 @@ def reconcile_sheet_pins(
                 )
                 continue
 
-            existing_pin_names = {p["name"] for p in sheet_dict["pins"]}
+            existing_pins = sheet_dict["pins"]
+            existing_pin_names = {p["name"] for p in existing_pins}
+            pin_set = set(pin_list)
+
             missing = [
                 n
                 for n in pin_list
                 if n not in existing_pin_names
                 and not _covered_by_existing_vector_pin(n, existing_pin_names)
             ]
-            if not missing:
-                continue
+
+            # #66: a stale SCALAR pin is one that's on disk, no longer in
+            # the freshly-computed required set, and not itself a
+            # bus-vector pin (those stay bus_emit.py's own territory --
+            # same reasoning as `_covered_by_existing_vector_pin` above, just
+            # the mirror-image guard: never touch anything vector-shaped
+            # here regardless of what's in pin_set, since pin_set only ever
+            # contains plain per-member net names, never a literal
+            # "NAME_[lo..hi]" string).
+            stale = [
+                p
+                for p in existing_pins
+                if p["name"] not in pin_set and not _VECTOR_PIN_RE.match(p["name"])
+            ]
 
             sheet_uuid = sheet_dict["uuid"]
+
+            for pin in stale:
+                net_name = pin["name"]
+                pin_uuid = pin.get("uuid")
+                if not pin_uuid:
+                    continue
+                removed = sch.sheets.remove_sheet_pin(sheet_uuid, pin_uuid)
+                if not removed:
+                    continue
+                modified = True
+                changes.append(
+                    f"{parent_path.name}: removed stale sheet pin '{net_name}' from "
+                    f"'{child_name}' sheet symbol (net no longer crosses this boundary)"
+                )
+                # Remove a tie label sitting exactly at this pin's own
+                # (former) coordinate on the parent's canvas, if present --
+                # same coordinate-exact match the ADD path uses to detect
+                # "already tied here". A label with the same text sitting
+                # somewhere ELSE on the canvas (e.g. a genuinely different,
+                # still-live use of the same net name at a component pin)
+                # must never be touched.
+                px = pin["position"]["x"]
+                py = pin["position"]["y"]
+                for lbl in list(sch.labels):
+                    if lbl.text == net_name and _same_point(lbl.position, px, py):
+                        sch.remove_label(lbl.uuid)
+                for lbl in list(sch.hierarchical_labels):
+                    if lbl.text == net_name and _same_point(lbl.position, px, py):
+                        sch.remove_hierarchical_label(lbl.uuid)
+
+            if not missing:
+                continue
             sx = sheet_dict["position"]["x"]
             sy = sheet_dict["position"]["y"]
             width = sheet_dict["size"]["width"]

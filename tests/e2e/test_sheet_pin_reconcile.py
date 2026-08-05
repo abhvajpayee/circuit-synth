@@ -331,6 +331,153 @@ def _v2_bus():
     return root()
 
 
+
+# --- Regression tests for wayfinder #66 -------------------------------------
+#
+# #65 fixed the ADD side of sheet-pin reconciliation (a net that starts
+# crossing an EXISTING sheet's boundary for the first time). It deliberately
+# left the REMOVE side unimplemented (see sheet_pin_sync.py's own module
+# docstring: "It only ever ADDS: never removes a pin/label whose net no
+# longer crosses a boundary"), citing map #54's caution around unverified
+# *component*-deletion scenarios.
+#
+# The real ADR-0027 shape on acquisition_analog_power.py is narrower than
+# that: no sheet or component is deleted -- an EXISTING call from an EXISTING
+# parent circuit to an EXISTING child circuit has one of its net ARGUMENTS
+# REBOUND to a different Net object (e.g. `buck_14v0(v24, ...)` ->
+# `buck_14v0(v24_sw12, ...)`, same call site, same parent/child sheet-symbol
+# edge). The child's own internal component-pin labels get renamed correctly
+# by ordinary per-pin sync (confirmed on the real board: "R53 pin 1:
+# '+24V_FILT' -> 'SW5V_SW'"), but the PARENT's sheet-symbol pin list for that
+# child keeps the stale old net's pin forever, since reconcile_sheet_pins()
+# never removes anything. `kicad-cli sch erc` then reports
+# `hier_label_mismatch` ("Sheet pin '<old net>' has no matching hierarchical
+# label inside the sheet") for every such stale pin, on every future sync,
+# even though a clean regen of the identical (new) source has no such pin at
+# all.
+#
+# Fixed by extending reconcile_sheet_pins() to also compute `stale` (an
+# existing SCALAR sheet pin -- never a bus-vector pin, that stays
+# bus_emit.py's own territory per _covered_by_existing_vector_pin -- whose
+# net no longer crosses this exact boundary) and remove it (and, if present,
+# its own matching tie label at the pin's old coordinate on the parent's
+# canvas) via kicad_sch_api's existing `SheetManager.remove_sheet_pin()` /
+# `Schematic.remove_label()` / `Schematic.remove_hierarchical_label()`.
+
+
+def _v1_rebind():
+    """Root component (J1, OLDNET) feeding an existing LEAF sheet's `vin`
+    parameter with OLDNET. GND is a second, unrelated net threaded alongside
+    it as a control -- it must never be touched by this fix."""
+
+    @circuit(name="leaf")
+    def leaf(vin, gnd):
+        r = Component(symbol="Device:R", ref="R", value="10k")
+        r[1] += vin
+        r[2] += gnd
+
+    @circuit(name="root")
+    def root():
+        gnd = Net("GND")
+        oldnet = Net("OLDNET")
+        j1 = Component(symbol="Connector_Generic:Conn_01x02", ref="J1")
+        j1[1] += oldnet
+        j1[2] += gnd
+        leaf(oldnet, gnd)
+
+    return root()
+
+
+def _v2_rebind():
+    """Same sheet hierarchy (leaf() already existed, same call site) -- but
+    leaf's `vin` argument is REBOUND from OLDNET to a brand-new NEWNET.
+    OLDNET still exists at root (still used by J1) -- it just no longer
+    reaches leaf's subtree, mirroring the real board's v24/v24_filt (which
+    stays alive elsewhere in Power()) vs. the 3 switched bucks' own INPUT
+    net changing to their own eFuse's output."""
+
+    @circuit(name="leaf")
+    def leaf(vin, gnd):
+        r = Component(symbol="Device:R", ref="R", value="10k")
+        r[1] += vin
+        r[2] += gnd
+
+    @circuit(name="root")
+    def root():
+        gnd = Net("GND")
+        oldnet = Net("OLDNET")
+        newnet = Net("NEWNET")
+        j1 = Component(symbol="Connector_Generic:Conn_01x02", ref="J1")
+        j1[1] += oldnet
+        j1[2] += gnd
+        j2 = Component(symbol="Connector_Generic:Conn_01x02", ref="J2")
+        j2[1] += newnet
+        j2[2] += gnd
+        leaf(newnet, gnd)  # <-- rebound: leaf used to receive oldnet
+
+    return root()
+
+
+def test_rebound_net_argument_adds_new_pin_and_removes_stale_one(tmp_path):
+    """leaf's own sheet-symbol (on root's canvas) must end up with NEWNET's
+    pin added, OLDNET's stale pin removed, and GND (the untouched control
+    net) left alone."""
+    proj = tmp_path / "root"
+    _generate(_build(_v1_rebind), proj, force=True)
+    _generate(_build(_v2_rebind), proj, force=False)
+
+    root_text = (proj / "root.kicad_sch").read_text()
+    leaf_pins = _sheet_pin_names(root_text, "leaf")
+
+    assert "NEWNET" in leaf_pins, f"missing newly-crossing pin NEWNET: {leaf_pins}"
+    assert "OLDNET" not in leaf_pins, (
+        f"stale OLDNET pin was not removed from leaf's sheet symbol "
+        f"(wayfinder #66 regression): {leaf_pins}"
+    )
+    assert "GND" in leaf_pins, f"unrelated control net GND was wrongly touched: {leaf_pins}"
+
+
+@pytest.mark.skipif(shutil.which("kicad-cli") is None, reason="kicad-cli not available")
+def test_rebind_sync_result_matches_clean_regen_erc(tmp_path):
+    """Same end-to-end bar as test_sync_result_matches_clean_regen_erc above:
+    an incrementally-synced project must report the same ERC violation
+    profile as a clean --force regen of the identical (_v2_rebind) source.
+    Before the fix the synced project additionally reported
+    hier_label_mismatch for the stale OLDNET pin."""
+    after = _build(_v2_rebind)
+
+    synced = tmp_path / "root"
+    _generate(_build(_v1_rebind), synced, force=True)
+    _generate(after, synced, force=False)
+
+    regen = tmp_path / "regen" / "root"
+    regen.parent.mkdir(parents=True, exist_ok=True)
+    _generate(after, regen, force=True)
+
+    def erc(project_dir: Path):
+        sch = project_dir / "root.kicad_sch"
+        out_json = project_dir / "erc.json"
+        subprocess.run(
+            ["kicad-cli", "sch", "erc", "--output", str(out_json),
+             "--format", "json", "--severity-all", str(sch)],
+            check=True, cwd=str(project_dir), capture_output=True, text=True,
+        )
+        data = json.loads(out_json.read_text())
+        types = {}
+        for sheet in data.get("sheets", []):
+            for v in sheet.get("violations", []):
+                types[v["type"]] = types.get(v["type"], 0) + 1
+        return types
+
+    synced_types = erc(synced)
+    regen_types = erc(regen)
+
+    assert synced_types == regen_types, (
+        f"incrementally-synced project's ERC profile diverges from a clean "
+        f"regen of the same source: synced={synced_types}, regen={regen_types}"
+    )
+
+
 def test_reconcile_does_not_add_duplicate_pin_for_existing_bus_member(tmp_path):
     """A net that's already exposed via an existing bus-vector sheet pin
     ("DATA[0..2]") must not also get a redundant, individually-named
