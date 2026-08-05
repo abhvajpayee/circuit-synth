@@ -495,6 +495,47 @@ class SchematicGenerator:
             sync_report = synchronizer.sync_with_circuit(top_circuit)
         logger.info("✅ Synchronization completed!")
 
+        # Wayfinder #65: HierarchicalSynchronizer above only reconciles each
+        # sheet's own LOCAL component pins (labels) -- it never touches a
+        # sheet-symbol's own pin list, which lives in the PARENT file. A net
+        # newly threaded through an existing intermediate sheet (new
+        # parameter on an already-existing sheet function) can therefore get
+        # a label at its use site with no matching sheet-symbol pin anywhere
+        # up the chain, which ERC reports as unconnected. Reconcile every
+        # (parent, child) sheet-symbol edge against what the Python circuit
+        # hierarchy says should cross it -- additive only (never removes a
+        # pin), same conservative philosophy as the rest of incremental
+        # sync. Must run before `_postprocess_schematic()`'s
+        # `fix_subsheet_labels()` pass (called later, from
+        # `generate_kicad_project()`), which -- based on this exact pin
+        # data -- decides whether an existing hierarchical_label at a
+        # non-root sheet's own use site is actually needed; running this
+        # first is what keeps that pass from wrongly demoting a
+        # hierarchical_label to a plain one just because the sheet pin this
+        # fix adds hadn't been added yet.
+        if has_subcircuits:
+            try:
+                from circuit_synth.kicad.schematic.sheet_pin_sync import (
+                    reconcile_sheet_pins,
+                )
+
+                pin_changes = reconcile_sheet_pins(
+                    project_dir=self.project_dir,
+                    root_circuit_name=top_circuit.name,
+                    subcircuits=sub_dict,
+                )
+                if pin_changes:
+                    logger.info(
+                        f"🔌 Reconciled {len(pin_changes)} missing sheet-symbol "
+                        f"pin/tie-label change(s):"
+                    )
+                    for change in pin_changes:
+                        logger.info(f"   {change}")
+                else:
+                    logger.debug("Sheet-symbol pin reconciliation: nothing to add")
+            except Exception as e:
+                logger.error(f"Sheet-symbol pin reconciliation failed: {e}", exc_info=True)
+
         # Add bounding boxes if requested
         if draw_bounding_boxes:
             logger.info("📦 Adding bounding boxes to visualize component placement...")

@@ -160,16 +160,45 @@ class APISynchronizer:
     and manipulation of schematic elements.
     """
 
-    def __init__(self, schematic_path: str, preserve_user_components: bool = False):
+    def __init__(
+        self,
+        schematic_path: str,
+        preserve_user_components: bool = False,
+        circuit_name: Optional[str] = None,
+        subcircuits: Optional[Dict[str, Any]] = None,
+    ):
         """
         Initialize the API synchronizer.
 
         Args:
             schematic_path: Path to the KiCad schematic file
             preserve_user_components: Whether to keep components not in circuit (default: False)
+            circuit_name: This sheet's own circuit name, as used as a key
+                into `subcircuits`. Together with `subcircuits`, lets
+                `_add_pin_label()` decide LOCAL vs HIERARCHICAL for a new
+                label the same way for every sheet, root included --
+                `boundary_nets.net_crosses_boundary(subcircuits,
+                circuit_name, net_name)` is False for a genuinely
+                sheet-local net on ANY sheet, and also naturally always
+                False for the root circuit specifically (root's own subtree
+                covers the whole project, so nothing is ever "outside" it --
+                no separate root-special-case branch needed here; see
+                `boundary_nets.net_crosses_boundary`'s docstring). Wayfinder
+                #65: both default to None (preserving the old, pre-#65
+                behavior -- always hierarchical) for any caller that has no
+                hierarchy context, e.g. a flat/non-hierarchical project or a
+                caller constructing this class directly for a test;
+                `HierarchicalSynchronizer` is the one place with this
+                context, and passes it explicitly via
+                `set_boundary_context()` once it has loaded the subcircuit
+                dict (not available yet at construction time).
+            subcircuits: `{circuit_name: Circuit}` -- see `circuit_name`
+                above.
         """
         self.schematic_path = Path(schematic_path)
         self.preserve_user_components = preserve_user_components
+        self._circuit_name = circuit_name
+        self._subcircuits = subcircuits
 
         # Load schematic
         self.schematic = self._load_schematic()
@@ -285,6 +314,20 @@ class APISynchronizer:
                     self._load_sheets_recursively(schematic, base_path, loaded_files)
             else:
                 logger.warning(f"Sheet file not found: {sheet_path}")
+
+    def set_boundary_context(self, circuit_name: str, subcircuits: Dict[str, Any]) -> None:
+        """
+        Give this synchronizer the hierarchy context `_add_pin_label()`
+        needs to decide LOCAL vs HIERARCHICAL generically (see the
+        `circuit_name`/`subcircuits` docstring on `__init__`). Not available
+        at construction time -- `HierarchicalSynchronizer` only learns the
+        subcircuit dict when `sync_with_circuit(circuit, subcircuit_dict)`
+        is called on IT, after every sheet's own `APISynchronizer` has
+        already been constructed -- so it calls this once it knows, right
+        before delegating to this sheet's own `sync_with_circuit()`.
+        """
+        self._circuit_name = circuit_name
+        self._subcircuits = subcircuits
 
     def sync_with_circuit(self, circuit) -> SyncReport:
         """
@@ -1112,6 +1155,49 @@ class APISynchronizer:
                 report=report
             )
             return success
+
+        # Wayfinder #65: decide LOCAL vs HIERARCHICAL the same way for every
+        # sheet -- via boundary_nets.net_crosses_boundary(), never a
+        # sheet-position-conditional branch. That function is False for the
+        # root circuit automatically (its own subtree covers the whole
+        # project, so nothing is ever "outside" it -- see its docstring),
+        # so a root sheet naturally gets a LOCAL label here with no special
+        # case, exactly like schematic_writer.py's clean-generation path.
+        # No hierarchy context (`_circuit_name`/`_subcircuits` unset) means
+        # this synchronizer has no way to know -- e.g. a flat/
+        # non-hierarchical project, or a caller constructing this class
+        # directly -- so it falls back to the pre-#65 default of always
+        # hierarchical.
+        if self._circuit_name is not None and self._subcircuits is not None:
+            from .. import boundary_nets
+
+            hierarchical = boundary_nets.net_crosses_boundary(
+                self._subcircuits, self._circuit_name, net_name
+            )
+        else:
+            hierarchical = True
+
+        if not hierarchical:
+            try:
+                logger.debug(
+                    f"'{net_name}' does not cross this sheet's boundary: "
+                    f"adding plain label via schematic.add_label() API"
+                )
+                label_uuid = self.schematic.add_label(
+                    text=net_name,
+                    position=(label_pos.x, label_pos.y),
+                    rotation=label_angle,
+                )
+                logger.debug(
+                    f"Local label added: '{net_name}' at ({label_pos.x:.2f}, "
+                    f"{label_pos.y:.2f}), angle={label_angle:.0f}, UUID={label_uuid}"
+                )
+                logger.info(f"Added label '{net_name}' at {kicad_component.reference} pin {pin_number}")
+                report.labels_added.append((kicad_component.reference, pin_number, net_name))
+                return True
+            except Exception as e:
+                logger.error(f"Failed to add local label: {e}", exc_info=True)
+                return False
 
         # Use kicad-sch-api's add_hierarchical_label() method
         # Hierarchical labels create electrical connections (regular labels don't)

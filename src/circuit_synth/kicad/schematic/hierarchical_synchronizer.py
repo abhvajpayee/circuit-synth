@@ -99,7 +99,11 @@ class HierarchicalSynchronizer:
 
             logger.debug(f"Parsed schematic has {len(schematic.components)} components")
 
-            # Create synchronizer for this sheet
+            # Create synchronizer for this sheet. Its boundary context
+            # (circuit_name/subcircuits, used by _add_pin_label() to decide
+            # LOCAL vs HIERARCHICAL for any new label -- wayfinder #65) is
+            # given later via set_boundary_context(), once sync_with_circuit()
+            # below has the subcircuit dict; not available yet here.
             sheet.synchronizer = APISynchronizer(
                 str(sheet.file_path),
                 preserve_user_components=self.preserve_user_components,
@@ -289,6 +293,14 @@ class HierarchicalSynchronizer:
         sheet_circuit = self._find_circuit_for_sheet(sheet, circuit, subcircuit_dict)
 
         if sheet_circuit and sheet.synchronizer:
+            # Wayfinder #65: give this sheet's synchronizer the hierarchy
+            # context it needs to decide LOCAL vs HIERARCHICAL for any new
+            # label generically (boundary_nets.net_crosses_boundary), not
+            # via a root-position special case -- see
+            # APISynchronizer.set_boundary_context()'s docstring.
+            sheet.synchronizer.set_boundary_context(
+                circuit_name=sheet_circuit.name, subcircuits=subcircuit_dict
+            )
             # Synchronize this sheet
             sheet_sync_report = sheet.synchronizer.sync_with_circuit(sheet_circuit)
 
